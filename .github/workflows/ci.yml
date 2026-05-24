@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest numpy pandas scikit-learn
+      - name: Rust tests
+        run: cargo test
+      - name: Build and install extension
+        run: |
+          maturin build --release --out dist --interpreter python
+          python -m pip install --force-reinstall dist/*.whl
+      - name: Python smoke tests
+        run: |
+          python -m py_compile gtboost/__init__.py gtboost/tuner.py gtboost/optuna_tuner.py tests/test_api_smoke.py
+          tmpdir="$(mktemp -d)"
+          cp tests/test_api_smoke.py "$tmpdir/"
+          cd "$tmpdir"
+          python -m pytest -q test_api_smoke.py

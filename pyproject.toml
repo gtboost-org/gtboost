@@ -1,0 +1,39 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "gtboost"
+version = "0.1.0a1"
+description = "Rust/Python gradient boosting for tabular data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "GTBoost contributors" }]
+dependencies = [
+    "numpy>=1.23",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/gtboost-org/gtboost"
+Repository = "https://github.com/gtboost-org/gtboost"
+
+[project.optional-dependencies]
+dataframe = ["pandas>=1.5"]
+tuning = ["optuna>=3", "scikit-learn>=1.2", "pandas>=1.5"]
+dev = ["pytest>=7", "pandas>=1.5", "scikit-learn>=1.2", "optuna>=3", "maturin>=1.5"]
+
+[tool.maturin]
+module-name = "gtboost.gtboost"
+python-source = "."
+features = ["pyo3/extension-module"]
+include = ["feature_transforms.py", "gtboost/*.py"]

@@ -1,0 +1,28 @@
+[package]
+name = "gtboost"
+version = "0.1.0"
+edition = "2021"
+description = "Rust/Python gradient boosting for tabular data"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/gtboost-org/gtboost"
+homepage = "https://github.com/gtboost-org/gtboost"
+rust-version = "1.85"
+
+[dependencies]
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+numpy = "0.28.0"
+rand = "0.10.1"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lib]
+name = "gtboost"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = "symbols"
+codegen-units = 1
