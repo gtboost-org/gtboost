@@ -258,52 +258,9 @@ def test_pcf_geometry_save_load_roundtrip(tmp_path):
     assert np.allclose(before, after, atol=1e-12, rtol=1e-12)
 
 
-def test_clt_geometry_save_load_roundtrip(tmp_path):
-    pytest.importorskip("scipy")
-    pytest.importorskip("sklearn")
-
-    rng = np.random.default_rng(20)
-    n = 160
-    X = np.column_stack(
-        [
-            np.arange(n) % 10,
-            np.arange(n) % 7,
-            rng.normal(size=n),
-        ]
-    ).astype(float)
-    y = (((X[:, 0] == 2) & (X[:, 1] == 5)) | (X[:, 2] > 1.0)).astype(float)
-
-    model = gtb.GTBoostModel(
-        task="binary",
-        n_estimators=10,
-        learning_rate=0.2,
-        max_depth=2,
-        cat_features=[True, True, False],
-        categorical_geometry="clt",
-        clt_config={
-            "max_cat": 2,
-            "max_pairs": 1,
-            "max_triples": 0,
-            "hash_dim": 4096,
-            "tuple_hash_bins": 4096,
-            "folds": 3,
-            "epochs": 3,
-            "alpha": 1e-2,
-            "clip_logit": 6.0,
-        },
-        seed=20,
-    )
-    model.fit(X[:120], y[:120])
-    assert model._clt_runtime is not None and model._clt_runtime.enabled
-    before = model.predict(X[120:])
-
-    path = tmp_path / "clt_model.gtboost"
-    model.save_model(path)
-    loaded = gtb.GTBoostModel.load_model(path)
-    after = loaded.predict(X[120:])
-
-    assert loaded._clt_runtime is not None and loaded._clt_runtime.enabled
-    assert np.allclose(before, after, atol=1e-12, rtol=1e-12)
+def test_unknown_categorical_geometry_is_rejected():
+    with pytest.raises(ValueError, match="categorical_geometry"):
+        gtb.GTBoostModel(categorical_geometry="unsupported_geometry")
 
 
 def test_training_is_deterministic_for_same_seed():

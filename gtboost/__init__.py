@@ -39,18 +39,11 @@ _BOOSTER_WRAPPER_VERSION = 1
 class GTBoostModel:
     """Thin Python wrapper around the native Rust model.
 
-    The wrapper preserves the normal Rust API and adds product-level categorical
-    geometry options:
-
-        categorical_geometry="pcf"
-        categorical_geometry="clt"
-        categorical_geometry="pcf_clt"
-
+    The wrapper preserves the normal Rust API and adds PCF categorical geometry.
     PCF uses private cross-fit folds inside ``fit`` to build leak-safe posterior
-    geometry for categorical columns. CLT trains a private crossed-logit teacher
-    and appends its out-of-fold train logit. Callers do not provide folds, split
-    ids, or target-encoding tables; fitted transformers are stored on the model
-    and applied automatically at prediction time.
+    geometry for categorical columns. Callers do not provide folds, split ids,
+    or target-encoding tables; fitted transformers are stored on the model and
+    applied automatically at prediction time.
     """
 
     def __init__(
@@ -58,7 +51,6 @@ class GTBoostModel:
         *args,
         categorical_geometry=None,
         pcf_config=None,
-        clt_config=None,
         **kwargs,
     ):
         self._raw_args = args
@@ -71,7 +63,6 @@ class GTBoostModel:
         self._default_n_rounds = int(default_rounds)
         self._raw_kwargs = kwargs
         self._pcf_config = dict(pcf_config or {})
-        self._clt_config = dict(clt_config or {})
         raw_geometry = None if categorical_geometry is None else str(categorical_geometry).lower()
         if raw_geometry in {"none", "off", "raw", "false", "0", ""}:
             raw_geometry = None
@@ -79,11 +70,8 @@ class GTBoostModel:
             self._pcf_config.setdefault("profile", "lite")
         self._categorical_geometry = {
             "pcf_lite": "pcf",
-            "eclt": "clt",
-            "pcf_eclt": "pcf_clt",
         }.get(raw_geometry, raw_geometry)
         self._pcf_runtime = None
-        self._clt_runtime = None
         self.categorical_geometry_info_ = {
             "enabled": False,
             "reason": "categorical_geometry disabled",
@@ -91,11 +79,10 @@ class GTBoostModel:
         self._model = None
         if self._categorical_geometry is None:
             self._model = _RustGTBoostModel(*self._raw_args, **self._raw_kwargs)
-        elif self._categorical_geometry not in {"pcf", "clt", "pcf_clt", "pcf+clt"}:
+        elif self._categorical_geometry != "pcf":
             raise ValueError(
                 "unknown categorical_geometry="
-                f"{categorical_geometry!r}; supported values are 'pcf', 'clt', 'pcf_clt'"
-                ", and aliases 'pcf_lite', 'eclt', 'pcf_eclt'"
+                f"{categorical_geometry!r}; supported values are 'pcf' and alias 'pcf_lite'"
             )
 
     def _seed(self) -> int:
@@ -221,112 +208,33 @@ class GTBoostModel:
         eval_y_fit = None if eval_y is None else np.asarray(eval_y, dtype=np.float64)
 
         if self._task() == "binary":
-            from feature_transforms import CLTGeometryRuntime, PCFGeometryRuntime
+            from feature_transforms import PCFGeometryRuntime
 
-            geom = "pcf_clt" if self._categorical_geometry == "pcf+clt" else self._categorical_geometry
             feature_view_groups = None
-            if geom == "pcf":
-                pcf_cat_feats = self._pcf_cat_features_for(X_np, cat_feats)
-                runtime = PCFGeometryRuntime(
-                    task_type="binary",
-                    n_classes=2,
-                    config=self._pcf_config,
-                    seed=self._seed(),
-                    fallback_raw=True,
-                )
-                X_fit, applied, out_cat, meta = runtime.fit_transform(
-                    X_np,
-                    y_np,
-                    pcf_cat_feats,
-                    apply_mats=eval_list,
-                )
-                out_cat = self._maybe_preserve_raw_cat_mask(out_cat, cat_feats, X_fit)
-                self._pcf_runtime = runtime if runtime.enabled else None
-                self._clt_runtime = None
-                self.categorical_geometry_info_ = dict(meta)
-                feature_view_groups = meta.get("feature_view_groups", None)
-                eval_fit = applied[0] if applied else eval_x_np
-            elif geom == "clt":
-                runtime = CLTGeometryRuntime(
-                    task_type="binary",
-                    n_classes=2,
-                    config=self._clt_config or self._pcf_config,
-                    seed=self._seed(),
-                    fallback_raw=True,
-                )
-                X_fit, applied, out_cat, meta = runtime.fit_transform(
-                    X_np,
-                    y_np,
-                    cat_feats,
-                    apply_mats=eval_list,
-                )
-                self._pcf_runtime = None
-                self._clt_runtime = runtime if runtime.enabled else None
-                self.categorical_geometry_info_ = dict(meta)
-                feature_view_groups = meta.get("feature_view_groups", None)
-                eval_fit = applied[0] if applied else eval_x_np
-            else:
-                pcf_cat_feats = self._pcf_cat_features_for(X_np, cat_feats)
-                pcf_runtime = PCFGeometryRuntime(
-                    task_type="binary",
-                    n_classes=2,
-                    config=self._pcf_config,
-                    seed=self._seed(),
-                    fallback_raw=True,
-                )
-                X_pcf, pcf_applied, pcf_cat, pcf_meta = pcf_runtime.fit_transform(
-                    X_np,
-                    y_np,
-                    pcf_cat_feats,
-                    apply_mats=eval_list,
-                )
-                pcf_cat = self._maybe_preserve_raw_cat_mask(pcf_cat, cat_feats, X_pcf)
-                clt_cfg = dict(self._clt_config or {})
-                clt_cfg.setdefault("view", "clt_only")
-                clt_runtime = CLTGeometryRuntime(
-                    task_type="binary",
-                    n_classes=2,
-                    config=clt_cfg,
-                    seed=self._seed() + 4049,
-                    fallback_raw=True,
-                )
-                X_clt, clt_applied, _clt_cat, clt_meta = clt_runtime.fit_transform(
-                    X_np,
-                    y_np,
-                    cat_feats,
-                    apply_mats=eval_list,
-                )
-                if X_clt.shape[1] > 0:
-                    X_fit = np.hstack([X_pcf, X_clt]).astype(np.float64)
-                    eval_fit = (
-                        np.hstack([pcf_applied[0], clt_applied[0]]).astype(np.float64)
-                        if eval_list else eval_x_np
-                    )
-                    out_cat = list(pcf_cat) + [False] * int(X_clt.shape[1])
-                    pcf_groups = list(pcf_meta.get("feature_view_groups", []))
-                    if pcf_groups:
-                        feature_view_groups = pcf_groups + [0] * int(X_clt.shape[1])
-                else:
-                    X_fit = X_pcf
-                    eval_fit = pcf_applied[0] if pcf_applied else eval_x_np
-                    out_cat = list(pcf_cat)
-                    feature_view_groups = pcf_meta.get("feature_view_groups", None)
-                self._pcf_runtime = pcf_runtime if pcf_runtime.enabled else None
-                self._clt_runtime = clt_runtime if clt_runtime.enabled else None
-                self.categorical_geometry_info_ = {
-                    "enabled": bool(self._pcf_runtime is not None or self._clt_runtime is not None),
-                    "reason": "PCF+CLT geometry enabled",
-                    "geometry": "pcf_clt",
-                    "pcf": dict(pcf_meta),
-                    "clt": dict(clt_meta),
-                    "n_output_features": int(X_fit.shape[1]),
-                }
+            pcf_cat_feats = self._pcf_cat_features_for(X_np, cat_feats)
+            runtime = PCFGeometryRuntime(
+                task_type="binary",
+                n_classes=2,
+                config=self._pcf_config,
+                seed=self._seed(),
+                fallback_raw=True,
+            )
+            X_fit, applied, out_cat, meta = runtime.fit_transform(
+                X_np,
+                y_np,
+                pcf_cat_feats,
+                apply_mats=eval_list,
+            )
+            out_cat = self._maybe_preserve_raw_cat_mask(out_cat, cat_feats, X_fit)
+            self._pcf_runtime = runtime if runtime.enabled else None
+            self.categorical_geometry_info_ = dict(meta)
+            feature_view_groups = meta.get("feature_view_groups", None)
+            eval_fit = applied[0] if applied else eval_x_np
             self._ensure_model(out_cat, feature_view_groups=feature_view_groups)
         else:
             X_fit = X_np
             eval_fit = eval_x_np
             self._pcf_runtime = None
-            self._clt_runtime = None
             self.categorical_geometry_info_ = {
                 "enabled": False,
                 "reason": "categorical_geometry is currently binary-only",
@@ -345,23 +253,8 @@ class GTBoostModel:
 
     def _transform_x(self, x):
         X_np = _to_numpy(x)
-        geom = "pcf_clt" if self._categorical_geometry == "pcf+clt" else self._categorical_geometry
-        if geom == "pcf_clt":
-            X_pcf = (
-                self._pcf_runtime.transform(X_np)
-                if self._pcf_runtime is not None and self._pcf_runtime.enabled
-                else X_np
-            )
-            X_clt = (
-                self._clt_runtime.transform(X_np)
-                if self._clt_runtime is not None and self._clt_runtime.enabled
-                else np.zeros((int(X_np.shape[0]), 0), dtype=np.float64)
-            )
-            return np.hstack([X_pcf, X_clt]).astype(np.float64) if X_clt.shape[1] else X_pcf
         if self._pcf_runtime is not None and self._pcf_runtime.enabled:
             return self._pcf_runtime.transform(X_np)
-        if self._clt_runtime is not None and self._clt_runtime.enabled:
-            return self._clt_runtime.transform(X_np)
         return X_np
 
     def predict(self, x, *args, **kwargs):
@@ -380,10 +273,7 @@ class GTBoostModel:
         return self._model.leaf_indices(self._transform_x(x), *args, **kwargs)
 
     def _has_active_python_geometry(self):
-        return (
-            (self._pcf_runtime is not None and self._pcf_runtime.enabled)
-            or (self._clt_runtime is not None and self._clt_runtime.enabled)
-        )
+        return self._pcf_runtime is not None and self._pcf_runtime.enabled
 
     def save_model(self, path):
         if self._model is None:
@@ -398,17 +288,14 @@ class GTBoostModel:
             "version": _PY_WRAPPER_VERSION,
             "categorical_geometry": self._categorical_geometry,
             "has_pcf_runtime": bool(self._pcf_runtime is not None and self._pcf_runtime.enabled),
-            "has_clt_runtime": bool(self._clt_runtime is not None and self._clt_runtime.enabled),
         }
         state = {
             "_raw_args": self._raw_args,
             "_raw_kwargs": self._raw_kwargs,
             "_default_n_rounds": self._default_n_rounds,
             "_pcf_config": self._pcf_config,
-            "_clt_config": self._clt_config,
             "_categorical_geometry": self._categorical_geometry,
             "_pcf_runtime": self._pcf_runtime,
-            "_clt_runtime": self._clt_runtime,
             "categorical_geometry_info_": self.categorical_geometry_info_,
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -420,8 +307,8 @@ class GTBoostModel:
                     json.dumps(metadata, sort_keys=True, indent=2).encode("utf-8"),
                 )
                 zf.write(rust_path, arcname="rust_model.json")
-                # PCF/CLT are Python runtimes; pickle keeps their NumPy tables
-                # and optional sklearn teacher state together with the Rust model.
+                # PCF is a Python runtime; pickle keeps its NumPy tables together
+                # with the Rust model.
                 zf.writestr(
                     "wrapper.pkl",
                     pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL),
@@ -452,10 +339,8 @@ class GTBoostModel:
             obj._raw_kwargs = dict(state.get("_raw_kwargs", {}))
             obj._default_n_rounds = int(state.get("_default_n_rounds", 0))
             obj._pcf_config = dict(state.get("_pcf_config", {}))
-            obj._clt_config = dict(state.get("_clt_config", {}))
             obj._categorical_geometry = state.get("_categorical_geometry", None)
             obj._pcf_runtime = state.get("_pcf_runtime", None)
-            obj._clt_runtime = state.get("_clt_runtime", None)
             obj.categorical_geometry_info_ = dict(
                 state.get(
                     "categorical_geometry_info_",
@@ -470,10 +355,8 @@ class GTBoostModel:
         obj._raw_kwargs = {}
         obj._default_n_rounds = 0
         obj._pcf_config = {}
-        obj._clt_config = {}
         obj._categorical_geometry = None
         obj._pcf_runtime = None
-        obj._clt_runtime = None
         obj.categorical_geometry_info_ = {
             "enabled": False,
             "reason": "loaded native model",

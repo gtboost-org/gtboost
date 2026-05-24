@@ -129,5 +129,4 @@ Stable-facing:
 
 Experimental:
 
-- CLT categorical teacher paths
 - broad research knobs in `GTBoostModel`
