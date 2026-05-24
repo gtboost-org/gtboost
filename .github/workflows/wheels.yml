@@ -85,6 +85,8 @@ jobs:
     needs: [build-wheels, build-sdist]
     if: github.event_name == 'release' && github.event.action == 'published'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -97,3 +99,21 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: [build-wheels, build-sdist]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
