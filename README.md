@@ -40,7 +40,7 @@ model = GTBoostRegressor(
 model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=100)
 
 pred = model.predict(X_test)
-print("RMSE:", mean_squared_error(y_test, pred, squared=False))
+print("RMSE:", mean_squared_error(y_test, pred))
 ```
 
 ## Native API
