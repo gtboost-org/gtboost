@@ -92,6 +92,54 @@ def test_sklearn_classifier_dataframe_smoke():
     assert np.allclose(proba.sum(axis=1), 1.0)
 
 
+def test_verbose_and_eval_attributes_for_sklearn_and_native(capfd):
+    df = _binary_frame(90)
+    X = df.drop(columns=["target"])
+    y = df["target"].to_numpy()
+
+    clf = GTBoostClassifier(
+        n_estimators=10,
+        learning_rate=0.2,
+        max_depth=2,
+        apx=False,
+        interval_splits=False,
+        categorical_geometry="raw",
+        early_stopping_rounds=4,
+        verbose=3,
+        seed=44,
+    )
+    clf.fit(X.iloc[:64], y[:64], eval_set=[(X.iloc[64:], y[64:])])
+    captured = capfd.readouterr()
+    assert "valid-loss" in captured.err
+    assert clf.best_iteration_ is not None
+    assert clf.best_score_ is not None
+    assert "validation_0" in clf.evals_result_
+    assert len(clf.evals_result_["validation_0"]["logloss"]) >= 1
+
+    train = gtb.Dataset(df.iloc[:64], label="target", categorical="auto")
+    valid = gtb.Dataset(df.iloc[64:], label="target", reference=train)
+    booster = gtb.train(
+        {
+            "objective": "binary",
+            "learning_rate": 0.2,
+            "max_depth": 2,
+            "categorical_geometry": "raw",
+            "interval_splits": False,
+            "verbose": False,
+            "random_state": 45,
+        },
+        train,
+        valid_sets=[valid],
+        num_boost_round=10,
+        early_stopping_rounds=4,
+    )
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert booster.best_iteration_ is not None
+    assert booster.best_score_ is not None
+    assert len(booster.evals_result_["validation_0"]["logloss"]) >= 1
+
+
 def test_sklearn_regressor_numpy_smoke():
     rng = np.random.default_rng(5)
     X = rng.normal(size=(70, 3))

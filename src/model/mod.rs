@@ -197,6 +197,8 @@ pub struct GTBoostModel {
     pub(super) n_leaf_splits: usize, // post-refinement leaf splitting passes (0 = disabled)
     pub(super) refine_every: usize, // refine all trees every N rounds during training (0 = only at end)
     pub(super) early_stopping_rounds: usize, // 0 = disabled
+    #[serde(default)]
+    pub(super) verbose: usize, // progress logging interval in rounds (0 = silent)
     pub(super) l1_reg: f64, // L1 regularization on leaf values during refinement (0 = disabled)
     pub(super) refine_alpha: f64, // refinement shrinkage: blend w_old + alpha*(w_new - w_old), 1.0 = full step
     pub(super) honest: bool, // honest estimation: build structure on half data, leaf values on other half
@@ -522,6 +524,7 @@ impl GTBoostModel {
         n_leaf_splits = 0,
         refine_every = 0,
         early_stopping_rounds = 0,
+        verbose = 0,
         l1_reg = 0.0,
         refine_alpha = 1.0,
         honest = false,
@@ -674,6 +677,7 @@ impl GTBoostModel {
         n_leaf_splits: usize,
         refine_every: usize,
         early_stopping_rounds: usize,
+        verbose: usize,
         l1_reg: f64,
         refine_alpha: f64,
         honest: bool,
@@ -827,6 +831,7 @@ impl GTBoostModel {
             n_leaf_splits,
             refine_every,
             early_stopping_rounds,
+            verbose,
             l1_reg,
             refine_alpha,
             honest,

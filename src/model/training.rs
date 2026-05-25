@@ -215,7 +215,8 @@ impl GTBoostModel {
         };
 
         // Early stopping state
-        let es_active = self.early_stopping_rounds > 0 && eval_data.is_some();
+        let eval_active = eval_data.is_some();
+        let early_stop_active = self.early_stopping_rounds > 0;
         let mut eval_preds: Vec<f64> = if let Some((_, _, en, _, _)) = eval_data {
             vec![self.base_score; *en]
         } else {
@@ -386,7 +387,7 @@ impl GTBoostModel {
             } else {
                 Vec::new()
             };
-            let round_eval_base = if use_sibling_block_correction && es_active {
+            let round_eval_base = if use_sibling_block_correction && eval_active {
                 eval_preds.clone()
             } else {
                 Vec::new()
@@ -1065,7 +1066,7 @@ impl GTBoostModel {
                         false
                     };
 
-                    if es_active {
+                    if eval_active {
                         let (eval_bins, _eval_y, en, _, eval_cll_bins) =
                             eval_data.as_ref().unwrap();
                         let en = *en;
@@ -1748,7 +1749,7 @@ impl GTBoostModel {
                         false
                     };
 
-                    if es_active {
+                    if eval_active {
                         let (eval_bins, _eval_y, en, _, eval_cll_bins) =
                             eval_data.as_ref().unwrap();
                         let en = *en;
@@ -1998,20 +1999,44 @@ impl GTBoostModel {
             }
 
             // Early stopping check (after all sub-trees in this round)
-            if es_active {
+            if eval_active {
                 let (_, eval_y, en, _, _) = eval_data.as_ref().unwrap();
                 let eval_loss = self.compute_eval_loss(eval_y, &eval_preds, *en);
                 // PASA: record val loss history for downstream plateau averaging
                 self.val_losses.push(eval_loss);
-                if eval_loss < best_eval_loss {
+                let improved = eval_loss < best_eval_loss;
+                if improved {
                     best_eval_loss = eval_loss;
                     best_round = self.trees.len();
                     rounds_without_improvement = 0;
                 } else {
                     rounds_without_improvement += 1;
-                    if rounds_without_improvement >= self.early_stopping_rounds {
-                        break;
+                }
+
+                let should_stop = early_stop_active
+                    && !improved
+                    && rounds_without_improvement >= self.early_stopping_rounds;
+                if self.verbose > 0
+                    && (round == 0 || (round + 1) % self.verbose == 0 || should_stop)
+                {
+                    eprintln!(
+                        "[{}]\tvalid-loss={:.6}\tbest={:.6}\tbest_trees={}",
+                        round + 1,
+                        eval_loss,
+                        best_eval_loss,
+                        best_round
+                    );
+                }
+
+                if should_stop {
+                    if self.verbose > 0 {
+                        eprintln!(
+                            "early stopping at round {}, best_trees={}",
+                            round + 1,
+                            best_round
+                        );
                     }
+                    break;
                 }
             }
 
@@ -2124,7 +2149,8 @@ impl GTBoostModel {
         self.best_round = best_round;
         // Trim to best round if early stopping triggered (unless keep_all_trees).
         // With keep_all_trees=True we retain the plateau buffer for averaging.
-        if es_active && best_round < self.trees.len() && !self.keep_all_trees {
+        if early_stop_active && eval_active && best_round < self.trees.len() && !self.keep_all_trees
+        {
             self.trees.truncate(best_round);
             if !self.tree_in_sample.is_empty() {
                 self.tree_in_sample.truncate(best_round);

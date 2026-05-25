@@ -373,7 +373,8 @@ impl GTBoostModel {
         let all_indices: Vec<u32> = (0..n_rows as u32).collect();
 
         // Early stopping state
-        let es_active = self.early_stopping_rounds > 0 && eval_data.is_some();
+        let eval_active = eval_data.is_some();
+        let early_stop_active = self.early_stopping_rounds > 0;
         let mut eval_preds: Vec<f64> = if let Some((_, _, en, _, _)) = eval_data {
             let mut v = vec![0.0f64; *en * n_classes];
             if self.class_base_scores.len() == n_classes {
@@ -1135,7 +1136,7 @@ impl GTBoostModel {
                                         self.learning_rate * tree.predict_binned(binned, i);
                                 }
 
-                                if es_active {
+                                if eval_active {
                                     let (eval_bins, _, en, _, eval_cll_bins) =
                                         eval_data.as_ref().unwrap();
                                     let en = *en;
@@ -1387,7 +1388,7 @@ impl GTBoostModel {
                                     }
                                 }
 
-                                if es_active {
+                                if eval_active {
                                     let (eval_bins, _, en, _, eval_cll_bins) =
                                         eval_data.as_ref().unwrap();
                                     let en = *en;
@@ -1748,7 +1749,7 @@ impl GTBoostModel {
                             }
                         }
 
-                        if es_active {
+                        if eval_active {
                             let (eval_bins, _, en, _, eval_cll_bins) = eval_data.as_ref().unwrap();
                             let en = *en;
                             for i in 0..en {
@@ -1777,22 +1778,48 @@ impl GTBoostModel {
             } // end if/else multi_output_tree
 
             // Early stopping check (after full round of K trees)
-            if es_active {
+            if eval_active {
                 let (_, eval_y, en, _, _) = eval_data.as_ref().unwrap();
                 let en = *en;
                 let eval_loss =
                     self.compute_multiclass_eval_loss(eval_y, &eval_preds, en, n_classes);
                 // PASA: record val loss history for plateau averaging
                 self.val_losses.push(eval_loss);
-                if eval_loss < best_eval_loss {
+                let improved = eval_loss < best_eval_loss;
+                if improved {
                     best_eval_loss = eval_loss;
                     best_round = round + 1;
                     rounds_without_improvement = 0;
                 } else {
                     rounds_without_improvement += 1;
-                    if rounds_without_improvement >= self.early_stopping_rounds {
-                        break;
+                }
+
+                let should_stop = early_stop_active
+                    && !improved
+                    && rounds_without_improvement >= self.early_stopping_rounds;
+                if self.verbose > 0
+                    && (round == 0 || (round + 1) % self.verbose == 0 || should_stop)
+                {
+                    let trees_per_round = n_classes * self.multiclass_trees_per_class_round();
+                    eprintln!(
+                        "[{}]\tvalid-logloss={:.6}\tbest={:.6}\tbest_trees={}",
+                        round + 1,
+                        eval_loss,
+                        best_eval_loss,
+                        best_round * trees_per_round
+                    );
+                }
+
+                if should_stop {
+                    if self.verbose > 0 {
+                        let trees_per_round = n_classes * self.multiclass_trees_per_class_round();
+                        eprintln!(
+                            "early stopping at round {}, best_trees={}",
+                            round + 1,
+                            best_round * trees_per_round
+                        );
                     }
+                    break;
                 }
             }
 
@@ -1850,7 +1877,11 @@ impl GTBoostModel {
         let trees_per_round = n_classes * self.multiclass_trees_per_class_round();
         self.best_round = best_round * trees_per_round;
         // Trim to best round if early stopping triggered (unless keep_all_trees).
-        if es_active && best_round * trees_per_round < self.trees.len() && !self.keep_all_trees {
+        if early_stop_active
+            && eval_active
+            && best_round * trees_per_round < self.trees.len()
+            && !self.keep_all_trees
+        {
             self.trees.truncate(best_round * trees_per_round);
             if !self.tree_in_sample.is_empty() {
                 self.tree_in_sample.truncate(best_round * trees_per_round);

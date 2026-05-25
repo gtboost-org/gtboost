@@ -77,6 +77,9 @@ class GTBoostModel:
             "reason": "categorical_geometry disabled",
         }
         self._model = None
+        self.evals_result_ = {}
+        self.best_iteration_ = None
+        self.best_score_ = None
         if self._categorical_geometry is None:
             self._model = _RustGTBoostModel(*self._raw_args, **self._raw_kwargs)
         elif self._categorical_geometry != "pcf":
@@ -187,7 +190,7 @@ class GTBoostModel:
             )
             if reference is not None and not self._raw_kwargs.get("cat_features"):
                 self._ensure_model(reference.cat_features)
-            return self._model.fit(
+            result = self._model.fit(
                 X_fit,
                 y,
                 n_rounds,
@@ -196,6 +199,8 @@ class GTBoostModel:
                 init_score=init_score,
                 sample_weight=sample_weight,
             )
+            _set_eval_attributes(self, self._model, self._task())
+            return result
 
         X_np = _to_numpy(x)
         y_np = np.asarray(y, dtype=np.float64)
@@ -241,7 +246,7 @@ class GTBoostModel:
             }
             self._ensure_model(cat_feats)
 
-        return self._model.fit(
+        result = self._model.fit(
             X_fit,
             y_np,
             n_rounds,
@@ -250,6 +255,8 @@ class GTBoostModel:
             init_score=init_score,
             sample_weight=sample_weight,
         )
+        _set_eval_attributes(self, self._model, self._task())
+        return result
 
     def _transform_x(self, x):
         X_np = _to_numpy(x)
@@ -792,6 +799,44 @@ def _should_use_oblique(oblique_flag, extra_params):
     return False
 
 
+def _normalize_verbose(verbose):
+    if verbose is True:
+        return 1
+    if verbose is False or verbose is None:
+        return 0
+    return max(0, int(verbose))
+
+
+def _eval_metric_name(task):
+    if task in {"binary", "multiclass", "rank"}:
+        return "logloss"
+    if task == "regression":
+        return "mse"
+    return "loss"
+
+
+def _set_eval_attributes(estimator, model, task):
+    losses = []
+    try:
+        losses = list(model.val_loss_history())
+    except Exception:
+        losses = []
+
+    estimator.evals_result_ = {}
+    estimator.best_iteration_ = None
+    estimator.best_score_ = None
+    if not losses:
+        return
+
+    metric = _eval_metric_name(task)
+    estimator.evals_result_ = {"validation_0": {metric: [float(v) for v in losses]}}
+    estimator.best_score_ = float(min(losses))
+    try:
+        estimator.best_iteration_ = int(model.best_tree_count())
+    except Exception:
+        estimator.best_iteration_ = int(np.argmin(losses) + 1)
+
+
 # ── APX: Accumulated Path eXpectation ─────────────────────────────────────────
 # Efron-Hastie-Tibshirani 2004: ε-stagewise boosting traces the LASSO
 # regularization path. Every point on the path is a valid L1-regularized
@@ -1150,6 +1195,7 @@ class GTBClassifier:
         grow_policy="depthwise",
         cat_features=None,
         early_stopping_rounds=0,
+        verbose=0,
         apx=True,
         apx_n_checkpoints=10,
         apx_min_frac=0.3,
@@ -1174,6 +1220,7 @@ class GTBClassifier:
         self.grow_policy = grow_policy
         self.cat_features = cat_features
         self.early_stopping_rounds = early_stopping_rounds
+        self.verbose = verbose
         self.apx = apx
         self.apx_n_checkpoints = apx_n_checkpoints
         self.apx_min_frac = apx_min_frac
@@ -1192,6 +1239,9 @@ class GTBClassifier:
         self._task = None
         self._mvpe_fits = None  # list of (state_tuple, model, cat_feats) when mvpe=True
         self._data_reference = None
+        self.evals_result_ = {}
+        self.best_iteration_ = None
+        self.best_score_ = None
 
     def _build_model(self, task, cat_feats):
         params = dict(
@@ -1207,6 +1257,7 @@ class GTBClassifier:
             grow_policy=self.grow_policy,
             cat_features=cat_feats,
             early_stopping_rounds=self.early_stopping_rounds,
+            verbose=_normalize_verbose(self.verbose),
         )
         if self.seed is not None:
             params["seed"] = self.seed
@@ -1272,6 +1323,7 @@ class GTBClassifier:
         else:
             self._model.fit(X_np, y_np, self.n_estimators)
 
+        _set_eval_attributes(self, self._model, self._task)
         return self
 
     def _fit_mvpe_classifier(self, X_np, y_np, cat_feats, eval_set):
@@ -1304,6 +1356,7 @@ class GTBClassifier:
                 grow_policy=self.grow_policy,
                 cat_features=cat_feats_v,
                 early_stopping_rounds=self.early_stopping_rounds,
+                verbose=_normalize_verbose(self.verbose),
                 seed=seed_base + view_idx,
             )
             params.update(self._extra_params)
@@ -1435,6 +1488,7 @@ class GTBClassifier:
             grow_policy=self.grow_policy,
             cat_features=self.cat_features,
             early_stopping_rounds=self.early_stopping_rounds,
+            verbose=self.verbose,
         )
         params.update(self._extra_params)
         return params
@@ -1491,10 +1545,12 @@ def _model_params_from_native(params, train_set, task, num_boost_round):
     p = dict(params or {})
     p.pop("objective", None)
     p.pop("metric", None)
-    p.pop("verbose", None)
     p.pop("num_boost_round", None)
     p.pop("categorical", None)
     p.pop("categorical_features", None)
+
+    if "verbose" in p:
+        p["verbose"] = _normalize_verbose(p["verbose"])
 
     if "random_state" in p and "seed" not in p:
         p["seed"] = p.pop("random_state")
@@ -1533,6 +1589,7 @@ class Booster:
         self.n_classes = int(n_classes)
         self.feature_names = list(train_set.feature_names)
         self.categorical_features = list(train_set.categorical_features)
+        _set_eval_attributes(self, self.model, self.task)
 
     def _matrix(self, data):
         if self.train_set is None:
@@ -1615,6 +1672,7 @@ class Booster:
                     obj.n_classes = int(state.get("n_classes", model.n_classes()))
                     obj.feature_names = list(state.get("feature_names", []))
                     obj.categorical_features = list(state.get("categorical_features", []))
+                    _set_eval_attributes(obj, obj.model, obj.task)
                     return obj
 
             model = GTBoostModel.load_model(path)
@@ -1628,6 +1686,7 @@ class Booster:
         obj.n_classes = int(model.n_classes())
         obj.feature_names = []
         obj.categorical_features = []
+        _set_eval_attributes(obj, obj.model, obj.task)
         return obj
 
     def predict_raw(self, data):
@@ -1751,6 +1810,9 @@ class GTBRegressor:
         Which features are categorical. Auto-detected from pandas DataFrames.
     early_stopping_rounds : int, default=0
         Stop if no improvement for this many rounds (requires eval_set).
+    verbose : int or bool, default=0
+        Training log interval. 0/False is silent, True/1 logs every round,
+        and an integer N logs every N rounds.
     huber_delta : float, default=0.0
         Huber loss delta (0.0 = MSE).
     **kwargs
@@ -1772,6 +1834,7 @@ class GTBRegressor:
         grow_policy="depthwise",
         cat_features=None,
         early_stopping_rounds=0,
+        verbose=0,
         huber_delta=0.0,
         apx=True,
         apx_n_checkpoints=10,
@@ -1797,6 +1860,7 @@ class GTBRegressor:
         self.grow_policy = grow_policy
         self.cat_features = cat_features
         self.early_stopping_rounds = early_stopping_rounds
+        self.verbose = verbose
         self.huber_delta = huber_delta
         self.apx = apx
         self.apx_n_checkpoints = apx_n_checkpoints
@@ -1813,6 +1877,9 @@ class GTBRegressor:
         self._apx_weights = None
         self._mvpe_fits = None
         self._data_reference = None
+        self.evals_result_ = {}
+        self.best_iteration_ = None
+        self.best_score_ = None
 
     def _build_model(self, cat_feats):
         params = dict(
@@ -1828,6 +1895,7 @@ class GTBRegressor:
             grow_policy=self.grow_policy,
             cat_features=cat_feats,
             early_stopping_rounds=self.early_stopping_rounds,
+            verbose=_normalize_verbose(self.verbose),
             huber_delta=self.huber_delta,
         )
         if self.seed is not None:
@@ -1884,6 +1952,7 @@ class GTBRegressor:
         else:
             self._model.fit(X_np, y_np, self.n_estimators)
 
+        _set_eval_attributes(self, self._model, "regression")
         return self
 
     def _fit_mvpe_regressor(self, X_np, y_np, cat_feats, eval_set):
@@ -1914,6 +1983,7 @@ class GTBRegressor:
                 grow_policy=self.grow_policy,
                 cat_features=cat_feats_v,
                 early_stopping_rounds=self.early_stopping_rounds,
+                verbose=_normalize_verbose(self.verbose),
                 huber_delta=self.huber_delta,
                 seed=seed_base + view_idx,
             )
@@ -1993,6 +2063,7 @@ class GTBRegressor:
             grow_policy=self.grow_policy,
             cat_features=self.cat_features,
             early_stopping_rounds=self.early_stopping_rounds,
+            verbose=self.verbose,
             huber_delta=self.huber_delta,
         )
         params.update(self._extra_params)
