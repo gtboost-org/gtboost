@@ -135,6 +135,50 @@ impl DecisionTree {
     }
 
     #[inline]
+    /// route_to_leaf variant that records every visited node (for tree-structured
+    /// Stein: per-node aggregates along paths). Same routing logic as route_to_leaf.
+    pub fn route_to_leaf_with_path(
+        &self,
+        binned: &BinnedData,
+        row: usize,
+        path: &mut Vec<u32>,
+    ) -> usize {
+        let mut node = 0usize;
+        loop {
+            path.push(node as u32);
+            let feat = self.split_features[node];
+            if feat == u32::MAX {
+                return node;
+            }
+            node = self.route_step(binned, row, node);
+        }
+    }
+
+    /// One routing step from an internal node (shared by path-recording walker).
+    #[inline]
+    fn route_step(&self, binned: &BinnedData, row: usize, node: usize) -> usize {
+        let left = self.left_children[node] as usize;
+        let right = self.right_children[node] as usize;
+        if self.is_oblique_split[node] {
+            if let Some(proj) = self.oblique_proj_binned(node, binned, row) {
+                if proj <= self.oblique_thresholds[node] as f64 { left } else { right }
+            } else if self.missing_goes_left[node] { left } else { right }
+        } else if self.is_cat_pair(node) {
+            match self.cat_pair_route_binned(node, binned, row) {
+                Some(true) => left,
+                Some(false) => right,
+                None => if self.missing_goes_left[node] { left } else { right },
+            }
+        } else {
+            let bin = binned.get_bin_u16(row, self.split_features[node] as usize);
+            if bin == MISSING_BIN {
+                if self.missing_goes_left[node] { left } else { right }
+            } else if self.is_cat_split[node] {
+                if bitmask_test(&self.cat_left_masks[node], bin as usize) { left } else { right }
+            } else if bin <= self.split_bins[node] { left } else { right }
+        }
+    }
+
     pub fn route_to_leaf(&self, binned: &BinnedData, row: usize) -> usize {
         let mut node = 0usize;
         loop {
@@ -342,7 +386,11 @@ impl DecisionTree {
             } else {
                 let split_bin = self.split_bins[node] as usize;
                 let edges = &binned.bin_edges[feat];
-                if split_bin < edges.len() && val <= edges[split_bin] {
+                // split_bin >= edges.len() means every reachable bin is <=
+                // split_bin -> LEFT, matching binned routing and the general
+                // raw paths (this fast path used to route RIGHT, disagreeing
+                // with every other inference entry point).
+                if split_bin >= edges.len() || val <= edges[split_bin] {
                     left
                 } else {
                     right
@@ -419,6 +467,61 @@ impl DecisionTree {
         }
     }
 
+    /// Row-major counterpart to [`predict_binned_plain_row_major`] that also
+    /// adds a leaf-level ramp/linear contribution. Used when the tree has
+    /// leaf-linear / ramp slopes but no oblique / cat-pair / CLL extras —
+    /// covers the leaf_linear configuration without the column-major slowdown
+    /// of the generic `predict_binned_raw` path.
+    #[inline]
+    pub fn predict_binned_plain_row_major_with_ramp(
+        &self,
+        bin_indices: &[u16],
+        n_features: usize,
+        row: usize,
+    ) -> f64 {
+        let mut node = 0usize;
+        let row_offset = row * n_features;
+        loop {
+            let feat = self.split_features[node];
+            if feat == u32::MAX {
+                return self.values[node]
+                    + self.ramp_predict_row_major(node, bin_indices, n_features, row);
+            }
+            let left = self.left_children[node] as usize;
+            let right = self.right_children[node] as usize;
+            let bin = bin_indices[row_offset + feat as usize];
+            node = if bin == MISSING_BIN {
+                if self.missing_goes_left[node] {
+                    left
+                } else {
+                    right
+                }
+            } else if self.is_cat_split[node] {
+                if bitmask_test(&self.cat_left_masks[node], bin as usize) {
+                    left
+                } else {
+                    right
+                }
+            } else if bin <= self.split_bins[node] {
+                left
+            } else {
+                right
+            };
+        }
+    }
+
+    /// Tree is "row-major eligible with ramp": same constraints as
+    /// `can_predict_binned_plain` but ramp / leaf_pair / quad slopes are OK
+    /// (handled by [`predict_binned_plain_row_major_with_ramp`]).
+    #[inline]
+    pub fn can_predict_binned_plain_with_ramp(&self) -> bool {
+        self.oblique_features.iter().all(|&f| f == u32::MAX)
+            && !self.is_oblique_split.iter().any(|&v| v)
+            && !self.cat_pair_feat2.iter().any(|&f| f != u32::MAX)
+            && !self.has_self_score_splits()
+            && self.cat_lookups.iter().all(|c| c.is_none())
+    }
+
     /// Check if tree uses CLL or ramp (for fast-path optimization).
     #[inline]
     fn has_cll_or_ramp(&self) -> bool {
@@ -433,6 +536,49 @@ impl DecisionTree {
 
     /// Batch predict: add lr * tree_prediction to predictions[i] for i in 0..n.
     /// Uses rayon for parallelism when n >= 4096.
+    /// Fused margin update from builder-captured leaf assignments: per-row
+    /// array lookups instead of tree traversals. Rows stamped u32::MAX (out of
+    /// the build subsample) fall back to traversal; trees with per-row
+    /// corrections (CLL/ramp) fall back entirely.
+    pub fn add_predictions_from_leaves(
+        &self,
+        binned: &BinnedData,
+        row_leaves: &[u32],
+        predictions: &mut [f64],
+        lr: f64,
+    ) {
+        if self.has_cll_or_ramp() || row_leaves.len() != predictions.len() {
+            return self.add_predictions_binned(binned, predictions, lr);
+        }
+        let n = predictions.len();
+        if n >= 8192 {
+            let chunk_size = (n / rayon::current_num_threads()).max(2048);
+            predictions
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let start = ci * chunk_size;
+                    for (j, pred) in chunk.iter_mut().enumerate() {
+                        let leaf = row_leaves[start + j];
+                        if leaf != u32::MAX {
+                            *pred += lr * self.values[leaf as usize];
+                        } else {
+                            *pred += lr * self.predict_binned_simple(binned, start + j);
+                        }
+                    }
+                });
+        } else {
+            for (i, pred) in predictions.iter_mut().enumerate() {
+                let leaf = row_leaves[i];
+                if leaf != u32::MAX {
+                    *pred += lr * self.values[leaf as usize];
+                } else {
+                    *pred += lr * self.predict_binned_simple(binned, i);
+                }
+            }
+        }
+    }
+
     pub fn add_predictions_binned(&self, binned: &BinnedData, predictions: &mut [f64], lr: f64) {
         let n = predictions.len();
         let simple = !self.has_cll_or_ramp();
@@ -1027,7 +1173,7 @@ impl DecisionTree {
                         let mut hi = n_bins;
                         while lo < hi {
                             let mid = lo + (hi - lo) / 2;
-                            if edges[mid] <= rv {
+                            if edges[mid] < rv {
                                 lo = mid + 1;
                             } else {
                                 hi = mid;
@@ -1170,6 +1316,158 @@ impl DecisionTree {
             }
         }
         total
+    }
+
+    /// Collect soft leaf memberships as (leaf_node, path_probability) pairs using
+    /// the SAME routing as `predict_raw_row_soft`: numeric splits route softly via
+    /// σ((thr - x)/(bw·scale)); categorical / oblique / missing-value splits hard
+    /// route (unseen categories marginalize over child training mass). Sharing one
+    /// router lets soft prediction and soft leaf refit stay consistent. Constant
+    /// leaves only — ramp terms are applied by the caller at predict time.
+    pub(crate) fn soft_collect_leaves(
+        &self,
+        binned: &BinnedData,
+        raw_row: &[f64],
+        bandwidth: f64,
+        feat_scales: &[f64],
+        out: &mut Vec<(usize, f64)>,
+    ) {
+        let mut stack: [(usize, f64); 128] = [(0, 0.0); 128];
+        stack[0] = (0usize, 1.0f64);
+        let mut sp = 1usize;
+        while sp > 0 {
+            sp -= 1;
+            let (node, w) = stack[sp];
+            if w < 1e-4 {
+                continue;
+            }
+            if self.split_features[node] == u32::MAX {
+                out.push((node, w));
+                continue;
+            }
+            let feat = self.split_features[node] as usize;
+            let left = self.left_children[node] as usize;
+            let right = self.right_children[node] as usize;
+            if self.is_oblique_split[node] {
+                let nxt = match self.oblique_proj_raw(node, binned, raw_row) {
+                    Some(proj) => {
+                        if proj <= self.oblique_thresholds[node] as f64 {
+                            left
+                        } else {
+                            right
+                        }
+                    }
+                    None => {
+                        if self.missing_goes_left[node] {
+                            left
+                        } else {
+                            right
+                        }
+                    }
+                };
+                if sp < 127 {
+                    stack[sp] = (nxt, w);
+                    sp += 1;
+                }
+                continue;
+            }
+            let val = binned.raw_value_for_feat(raw_row, feat);
+            if val.is_nan() {
+                let nxt = if self.missing_goes_left[node] {
+                    left
+                } else {
+                    right
+                };
+                if sp < 127 {
+                    stack[sp] = (nxt, w);
+                    sp += 1;
+                }
+            } else if self.is_cat_pair(node) {
+                match self.cat_pair_route_raw_row(node, binned, raw_row) {
+                    Some(true) => {
+                        if sp < 127 {
+                            stack[sp] = (left, w);
+                            sp += 1;
+                        }
+                    }
+                    Some(false) => {
+                        if sp < 127 {
+                            stack[sp] = (right, w);
+                            sp += 1;
+                        }
+                    }
+                    None => {
+                        if let Some((wl, wr)) = self.child_mass_weights(left, right) {
+                            let w_left = w * wl;
+                            let w_right = w - w_left;
+                            if sp < 127 && w_right > 1e-4 {
+                                stack[sp] = (right, w_right);
+                                sp += 1;
+                            }
+                            if sp < 127 && w_left > 1e-4 {
+                                stack[sp] = (left, w_left);
+                                sp += 1;
+                            }
+                        } else {
+                            out.push((node, w));
+                        }
+                    }
+                }
+            } else if self.is_cat_split[node] {
+                if let Some(bin) = Self::raw_cat_bin(&binned.bin_edges[feat], val) {
+                    let nxt = if bitmask_test(&self.cat_left_masks[node], bin) {
+                        left
+                    } else {
+                        right
+                    };
+                    if sp < 127 {
+                        stack[sp] = (nxt, w);
+                        sp += 1;
+                    }
+                } else if let Some((wl, wr)) = self.child_mass_weights(left, right) {
+                    let w_left = w * wl;
+                    let w_right = w - w_left;
+                    if sp < 127 && w_right > 1e-4 {
+                        stack[sp] = (right, w_right);
+                        sp += 1;
+                    }
+                    if sp < 127 && w_left > 1e-4 {
+                        stack[sp] = (left, w_left);
+                        sp += 1;
+                    }
+                } else {
+                    out.push((node, w));
+                }
+            } else {
+                let split_bin = self.split_bins[node] as usize;
+                let edges = &binned.bin_edges[feat];
+                if split_bin >= edges.len() {
+                    if sp < 127 {
+                        stack[sp] = (left, w);
+                        sp += 1;
+                    }
+                    continue;
+                }
+                let threshold = edges[split_bin];
+                let scale = if feat < feat_scales.len() && feat_scales[feat] > 0.0 {
+                    feat_scales[feat]
+                } else {
+                    1.0
+                };
+                let dx = (threshold - val) / (bandwidth * scale);
+                let p_left = 1.0 / (1.0 + (-dx).exp());
+                let w_left = w * p_left;
+                let w_right = w - w_left;
+                if sp < 127 && w_right > 1e-4 {
+                    stack[sp] = (right, w_right);
+                    sp += 1;
+                }
+                if sp < 127 && w_left > 1e-4 {
+                    stack[sp] = (left, w_left);
+                    sp += 1;
+                }
+            }
+        }
     }
 
     /// PRM — Posterior Refinement Marginalization. Walk tree with confidence-aware
@@ -1397,7 +1695,7 @@ impl DecisionTree {
                 let mut hi = edges.len();
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
-                    if edges[mid] <= rv {
+                    if edges[mid] < rv {
                         lo = mid + 1;
                     } else {
                         hi = mid;
@@ -1458,7 +1756,7 @@ impl DecisionTree {
                             let mut hi = edges.len();
                             while lo < hi {
                                 let mid = lo + (hi - lo) / 2;
-                                if edges[mid] <= vi {
+                                if edges[mid] < vi {
                                     lo = mid + 1;
                                 } else {
                                     hi = mid;
@@ -1476,7 +1774,7 @@ impl DecisionTree {
                             let mut hi = edges.len();
                             while lo < hi {
                                 let mid = lo + (hi - lo) / 2;
-                                if edges[mid] <= vj {
+                                if edges[mid] < vj {
                                     lo = mid + 1;
                                 } else {
                                     hi = mid;

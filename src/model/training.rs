@@ -26,10 +26,418 @@ use super::GTBoostModel;
 use crate::helpers::{bitvec_new, bitvec_set, bitvec_test, transform_gradients_for_split};
 use crate::tree::{BinnedData, CatPairConfig, DecisionTree};
 
+#[inline]
+fn adaptive_soft_depth_limit(grow_policy: &str, requested_depth: usize) -> usize {
+    let _ = grow_policy;
+    requested_depth
+}
+
 impl GTBoostModel {
+
+    /// SP-GBDT leaf estimator (owner proposal, probe-validated 2026-06-12):
+    /// treat the tree's plug-in Newton leaf vector as a noisy estimate of the
+    /// population Newton field; apply joint positive-part Stein shrinkage
+    /// alpha = max(0, 1 - (K-2)*sigma2/q), q = sum G_j^2/(H_j+lambda), with
+    /// sigma2 = within-leaf gradient overdispersion / hessian mass (clipped).
+    /// Joint shrinkage (one alpha per tree) — per-leaf independent shrinkage
+    /// was measured harmful (leaf_eb); the theorem needs the joint estimator.
+    pub(super) fn apply_stein_leaves(
+        tree: &mut DecisionTree,
+        binned: &BinnedData,
+        gradients: &[f64],
+        hessians: &[f64],
+        indices: &[u32],
+        lambda: f64,
+        logistic_scale: bool,
+        levels: bool,
+    ) {
+        if levels {
+            return Self::apply_stein_levels(
+                tree, binned, gradients, hessians, indices, lambda, logistic_scale,
+            );
+        }
+        let n_nodes = tree.split_features.len();
+        if n_nodes == 0 || indices.is_empty() {
+            return;
+        }
+        let mut leaf_of = Vec::with_capacity(indices.len());
+        let mut g_leaf = vec![0.0f64; n_nodes];
+        let mut h_leaf = vec![0.0f64; n_nodes];
+        for &i in indices {
+            let leaf = tree.route_to_leaf(binned, i as usize);
+            leaf_of.push(leaf);
+            if leaf < n_nodes {
+                g_leaf[leaf] += gradients[i as usize];
+                h_leaf[leaf] += hessians[i as usize];
+            }
+        }
+        let mut k = 0usize;
+        let mut z2 = 0.0f64;
+        let mut g_tot = 0.0f64;
+        let mut a_tot = 0.0f64;
+        for j in 0..n_nodes {
+            if tree.split_features[j] == u32::MAX && h_leaf[j] > 0.0 {
+                k += 1;
+                z2 += g_leaf[j] * g_leaf[j] / (h_leaf[j] + lambda);
+                g_tot += g_leaf[j];
+                a_tot += h_leaf[j] + lambda;
+            }
+        }
+        if k < 4 {
+            return;
+        }
+        // Calibration-preserving projection (SP-GBDT §2.5): the constant
+        // score-shift direction s_j = sqrt(A_j) is NOT shrunk — only leaf
+        // CONTRASTS are. In unwhitened coordinates this is a blend toward the
+        // global Newton step c = -ΣG/ΣA rather than toward zero, which is what
+        // made the unprojected variant hurt clean/structured data (it dragged
+        // the calibration component down with the noise).
+        let q = (z2 - g_tot * g_tot / a_tot.max(1e-12)).max(0.0);
+        let d_perp = k - 1;
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (pos, &i) in indices.iter().enumerate() {
+            let leaf = leaf_of[pos];
+            if leaf >= n_nodes || h_leaf[leaf] <= 0.0 {
+                continue;
+            }
+            let gbar = g_leaf[leaf] / h_leaf[leaf] * hessians[i as usize];
+            let r = gradients[i as usize] - gbar;
+            num += r * r;
+            den += hessians[i as usize];
+        }
+        // The [0.02, 2] clamp is an overdispersion guard valid only on the
+        // hessian-whitened LOGISTIC scale (sigma^2 ~= 1 when well-specified).
+        // Regression's sigma^2 is residual variance in target units — clamping
+        // it to logistic range silently disables (large targets) or over-shrinks
+        // (small targets) the mechanism; there it stays unclamped.
+        let sigma2 = if logistic_scale {
+            (num / den.max(1e-12)).clamp(0.02, 2.0)
+        } else {
+            (num / den.max(1e-12)).max(1e-12)
+        };
+        let alpha = (1.0 - (d_perp as f64 - 2.0) * sigma2 / q.max(1e-12)).max(0.0);
+        if alpha >= 1.0 {
+            return;
+        }
+        let c = -g_tot / a_tot.max(1e-12);
+        for j in 0..n_nodes {
+            if tree.split_features[j] == u32::MAX && h_leaf[j] > 0.0 {
+                tree.values[j] = alpha * tree.values[j] + (1.0 - alpha) * c;
+            }
+        }
+    }
+
+
+    /// Tree-structured Stein (per-LEVEL pooled blocks): a leaf value is the sum of
+    /// path contrasts; each depth band gets its own positive-part Stein factor,
+    /// bands pooled until >=6 dims so the theorem applies everywhere. Deep
+    /// thin-evidence corrections shrink hard, well-evidenced shallow calls pass —
+    /// smooth adaptive depth, measured from each tree's own data.
+    fn apply_stein_levels(
+        tree: &mut DecisionTree,
+        binned: &BinnedData,
+        gradients: &[f64],
+        hessians: &[f64],
+        indices: &[u32],
+        lambda: f64,
+        logistic_scale: bool,
+    ) {
+        let n_nodes = tree.split_features.len();
+        if n_nodes < 4 || indices.is_empty() {
+            return;
+        }
+        // per-node aggregates along each row's path
+        let mut g_node = vec![0.0f64; n_nodes];
+        let mut h_node = vec![0.0f64; n_nodes];
+        let mut leaf_of = Vec::with_capacity(indices.len());
+        let mut path: Vec<u32> = Vec::with_capacity(64);
+        for &i in indices {
+            path.clear();
+            let leaf = tree.route_to_leaf_with_path(binned, i as usize, &mut path);
+            leaf_of.push(leaf);
+            for &nd in &path {
+                g_node[nd as usize] += gradients[i as usize];
+                h_node[nd as usize] += hessians[i as usize];
+            }
+        }
+        // sigma^2: leaf-level overdispersion (same estimator as the global variant)
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (pos, &i) in indices.iter().enumerate() {
+            let leaf = leaf_of[pos];
+            if h_node[leaf] <= 0.0 {
+                continue;
+            }
+            let gbar = g_node[leaf] / h_node[leaf] * hessians[i as usize];
+            let r = gradients[i as usize] - gbar;
+            num += r * r;
+            den += hessians[i as usize];
+        }
+        let sigma2 = if logistic_scale {
+            (num / den.max(1e-12)).clamp(0.02, 2.0)
+        } else {
+            (num / den.max(1e-12)).max(1e-12)
+        };
+        // depths and parents
+        let mut depth = vec![0usize; n_nodes];
+        let mut parent = vec![usize::MAX; n_nodes];
+        let mut stack = vec![(0usize, 0usize)];
+        let mut max_depth = 0usize;
+        while let Some((nd, dp)) = stack.pop() {
+            depth[nd] = dp;
+            max_depth = max_depth.max(dp);
+            if tree.split_features[nd] != u32::MAX {
+                for ch in [tree.left_children[nd] as usize, tree.right_children[nd] as usize] {
+                    if ch < n_nodes {
+                        parent[ch] = nd;
+                        stack.push((ch, dp + 1));
+                    }
+                }
+            }
+        }
+        // whitened contrasts and pooled per-level alphas
+        let w = |nd: usize| -> f64 {
+            if h_node[nd] > 0.0 { -g_node[nd] / (h_node[nd] + lambda) } else { 0.0 }
+        };
+        let mut alpha_of_level = vec![1.0f64; max_depth + 1];
+        let mut lv = 1usize;
+        while lv <= max_depth {
+            let mut d = 0usize;
+            let mut q = 0.0f64;
+            let mut lv2 = lv;
+            while lv2 <= max_depth && d < 6 {
+                for nd in 0..n_nodes {
+                    if depth[nd] == lv2 && parent[nd] != usize::MAX && h_node[nd] > 0.0 {
+                        let contr = w(nd) - w(parent[nd]);
+                        q += contr * contr * (h_node[nd] + lambda);
+                        d += 1;
+                    }
+                }
+                lv2 += 1;
+            }
+            let a = if d >= 3 {
+                (1.0 - (d as f64 - 2.0) * sigma2 / q.max(1e-12)).max(0.0)
+            } else {
+                1.0
+            };
+            for l in lv..lv2 {
+                alpha_of_level[l] = a;
+            }
+            lv = lv2;
+        }
+        // rebuild values topologically: w_adj(child) = w_adj(parent) + alpha*contrast
+        let mut order: Vec<usize> = (0..n_nodes).collect();
+        order.sort_by_key(|&nd| depth[nd]);
+        let mut w_adj = vec![0.0f64; n_nodes];
+        for &nd in &order {
+            if parent[nd] == usize::MAX {
+                w_adj[nd] = w(nd);
+            } else {
+                w_adj[nd] = w_adj[parent[nd]]
+                    + alpha_of_level[depth[nd]] * (w(nd) - w(parent[nd]));
+            }
+        }
+        for nd in 0..n_nodes {
+            if tree.split_features[nd] == u32::MAX && h_node[nd] > 0.0 {
+                tree.values[nd] = w_adj[nd];
+            }
+        }
+    }
+
     #[inline]
     fn sigmoid_margin(x: f64) -> f64 {
         1.0 / (1.0 + (-x.clamp(-35.0, 35.0)).exp())
+    }
+
+    #[inline]
+    fn residual_focus_split_only(&self) -> bool {
+        matches!(
+            self.residual_focus_mode.as_str(),
+            "split" | "split_only" | "structure" | "structure_only"
+        )
+    }
+
+    #[inline]
+    fn residual_focus_phi(&self, z: f64) -> (f64, f64) {
+        let z = z.max(0.0);
+        let a = z / (1.0 + z);
+        let da = 1.0 / (1.0 + z).powi(2);
+        let tau = self.residual_focus_redescend_tau;
+        if tau > 0.0 {
+            let b = tau / (tau + z);
+            let db = -tau / (tau + z).powi(2);
+            let phi = a * b;
+            let z_phi_prime = z * (da * b + a * db);
+            (phi.max(0.0), z_phi_prime)
+        } else {
+            (a, z * da)
+        }
+    }
+
+    #[inline]
+    fn residual_focus_scales(&self, z: f64) -> (f64, f64) {
+        let (phi, z_phi_prime) = self.residual_focus_phi(z);
+        let alpha = self.residual_focus_alpha;
+        let g_scale = (1.0 + alpha * phi).clamp(1e-6, self.residual_focus_max_scale.max(1.0));
+        let h_raw = match self.residual_focus_hessian_mode.as_str() {
+            "none" | "raw" | "gradient_only" => 1.0,
+            "true" | "curvature" => 1.0 + alpha * (phi + z_phi_prime),
+            _ => g_scale,
+        };
+        let h_scale = h_raw
+            .max(1e-6)
+            .min(self.residual_focus_max_scale.max(1.0));
+        (g_scale, h_scale)
+    }
+
+    fn apply_residual_focus(&self, gradients: &mut [f64], hessians: &mut [f64]) {
+        if self.residual_focus_alpha <= 0.0
+            || gradients.is_empty()
+            || gradients.len() != hessians.len()
+            || (self.task != "binary" && self.task != "regression")
+        {
+            return;
+        }
+        let mut abs_g: Vec<f64> = gradients
+            .iter()
+            .map(|g| g.abs())
+            .filter(|v| v.is_finite())
+            .collect();
+        if abs_g.is_empty() {
+            return;
+        }
+        let mid = abs_g.len() / 2;
+        abs_g.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let med = abs_g[mid].max(1e-12);
+        for (g, h) in gradients.iter_mut().zip(hessians.iter_mut()) {
+            let z = (g.abs() / med).clamp(0.0, 50.0);
+            let (g_scale, h_scale) = self.residual_focus_scales(z);
+            *g *= g_scale;
+            *h = (*h * h_scale).max(1e-16);
+        }
+    }
+
+    #[inline]
+    fn auto_split_audit_fraction(
+        &self,
+        binned: &BinnedData,
+        sample_rows: usize,
+        grow_policy: &str,
+        extra_trees: bool,
+    ) -> f64 {
+        if self.honest || grow_policy != "depthwise" || extra_trees || sample_rows < 256 {
+            return 0.0;
+        }
+
+        let mut cat_features = 0usize;
+        let mut total_cat_width = 0usize;
+        let mut max_cat_bins = 0usize;
+        for feat in 0..binned.n_features {
+            if binned.is_categorical.get(feat).copied().unwrap_or(false) {
+                let bins = binned.n_bins(feat);
+                if bins > 1 {
+                    cat_features += 1;
+                    max_cat_bins = max_cat_bins.max(bins);
+                    total_cat_width += bins.saturating_sub(1).min(1024);
+                }
+            }
+        }
+        if cat_features == 0 || total_cat_width < 64 {
+            return 0.0;
+        }
+        if binned.n_features < 8 && cat_features < 2 {
+            return 0.0;
+        }
+
+        let numeric_features = binned.n_features.saturating_sub(cat_features);
+        let row_log = (sample_rows.max(2) as f64).ln_1p().max(1e-12);
+        let width_risk = (total_cat_width.max(2) as f64).ln_1p() / row_log;
+        let cardinality_risk = (max_cat_bins as f64 / sample_rows.max(1) as f64)
+            .sqrt()
+            .clamp(0.0, 1.0);
+        let competition_risk = if numeric_features >= 4 { 0.18 } else { 0.0 };
+        let interaction_risk = if cat_features >= 2 { 0.12 } else { 0.0 };
+        let risk = (0.52 * width_risk.clamp(0.0, 1.2)
+            + 0.28 * cardinality_risk
+            + competition_risk
+            + interaction_risk)
+            .clamp(0.0, 1.0);
+
+        if risk >= 0.68 {
+            0.30
+        } else if risk >= 0.56 {
+            0.22
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    fn gate_leaf_lookups_by_eval(
+        &self,
+        tree: &mut DecisionTree,
+        eval_data: Option<&(Vec<u16>, Vec<f64>, usize, Vec<f64>, Vec<u16>)>,
+        eval_preds: &[f64],
+        learning_rate: f64,
+    ) {
+        if !self.adaptive_leaf_experts || self.cat_lookup_smooth <= 0.0 {
+            return;
+        }
+        let lookup_bins: usize = tree
+            .cat_lookups
+            .iter()
+            .filter_map(|lookup| lookup.as_ref())
+            .map(|lookup| lookup.bin_values.len())
+            .sum();
+        if lookup_bins == 0 {
+            return;
+        }
+        let Some((eval_bins, eval_y, n_eval, _, eval_cll_bins)) = eval_data else {
+            return;
+        };
+        let n_eval = *n_eval;
+        if n_eval == 0 || eval_preds.len() < n_eval || eval_y.len() < n_eval {
+            return;
+        }
+
+        let mut with_lookup = eval_preds[..n_eval].to_vec();
+        tree.add_predictions_binned_raw(
+            eval_bins,
+            n_eval,
+            &mut with_lookup,
+            learning_rate,
+            eval_cll_bins,
+        );
+        let with_loss = self.compute_eval_loss(eval_y, &with_lookup, n_eval);
+
+        let mut plain_tree = tree.clone();
+        for lookup in &mut plain_tree.cat_lookups {
+            *lookup = None;
+        }
+        let mut without_lookup = eval_preds[..n_eval].to_vec();
+        plain_tree.add_predictions_binned_raw(
+            eval_bins,
+            n_eval,
+            &mut without_lookup,
+            learning_rate,
+            eval_cll_bins,
+        );
+        let without_loss = self.compute_eval_loss(eval_y, &without_lookup, n_eval);
+        if !without_loss.is_finite() {
+            return;
+        }
+
+        let base_loss = self.compute_eval_loss(eval_y, eval_preds, n_eval);
+        let complexity = (lookup_bins as f64).ln_1p().min(20.0) / 20.0;
+        let min_improvement = 1e-7 + 1e-4 * base_loss.abs().max(1e-6) * (1.0 + complexity);
+        if !with_loss.is_finite() || with_loss + min_improvement >= without_loss {
+            for lookup in &mut tree.cat_lookups {
+                *lookup = None;
+            }
+        }
     }
 
     fn training_margins_from_trees(&self, binned: &BinnedData, n_rows: usize) -> Vec<f64> {
@@ -52,6 +460,352 @@ impl GTBoostModel {
             }
         }
         out
+    }
+
+    /// SCB — Smooth Consistent Boosting. After the hard-routed trees are built,
+    /// refit their constant leaves under SOFT routing (coordinate descent over the
+    /// trees on the shared residual), then turn soft prediction on. This turns the
+    /// one boosted model into a smooth function approximator whose leaves are
+    /// optimal for the smooth prediction — fixing the train/test mismatch that
+    /// makes predict-time-only soft routing hurt. Binary / regression only; the
+    /// prediction stays a convex blend of leaf constants so it cannot blow up the
+    /// way locally linear leaves do.
+    #[allow(clippy::too_many_arguments)]
+    fn soft_consistent_refit(
+        &mut self,
+        binned: &BinnedData,
+        y: &[f64],
+        n_rows: usize,
+        x_data_raw: &[f64],
+        n_features_original: usize,
+        sample_weight: Option<&[f64]>,
+        init_score: Option<&[f64]>,
+        eval_data: &Option<(Vec<u16>, Vec<f64>, usize, Vec<f64>, Vec<u16>)>,
+        eval_init_score: Option<&[f64]>,
+    ) {
+        let raw_bw = self.soft_leaf_bandwidth;
+        if raw_bw == 0.0
+            || self.trees.is_empty()
+            || n_rows == 0
+            || n_features_original == 0
+            || n_features_original != binned.n_features
+            || (self.task != "binary" && self.task != "regression")
+        {
+            return;
+        }
+        let feat_scales = self.soft_feat_scales(binned, n_features_original);
+
+        // A negative bandwidth means AUTO: train hard, soft-refit at each grid
+        // bandwidth, keep whichever (including hard) minimizes eval loss. This is
+        // a strict no-regression guard — soft routing is adopted only where the
+        // held-out curve says it helps, so the feature is universally safe and
+        // needs no HPO budget. Fixed positive bandwidths skip the search.
+        let auto = raw_bw < 0.0;
+        let candidates: Vec<f64> = if auto {
+            vec![0.3, 0.5, 0.8, 1.2]
+        } else {
+            vec![raw_bw]
+        };
+
+        // Snapshot the hard-routed leaf values so each candidate starts clean.
+        let snapshot: Vec<Vec<f64>> = self.trees.iter().map(|t| t.values.clone()).collect();
+        let restore = |trees: &mut Vec<DecisionTree>| {
+            for (t, snap) in trees.iter_mut().zip(snapshot.iter()) {
+                t.values.clone_from(snap);
+            }
+        };
+
+        let have_eval = matches!(eval_data, Some((_, _, en, raw, _))
+            if *en > 0 && raw.len() == en * n_features_original);
+        // With no eval set we cannot validate the choice, so auto stays hard.
+        if auto && !have_eval {
+            return;
+        }
+
+        let hard_loss = if have_eval {
+            self.soft_eval_loss(
+                binned,
+                eval_data,
+                eval_init_score,
+                0.0,
+                n_features_original,
+                &feat_scales,
+            )
+        } else {
+            f64::INFINITY
+        };
+        let mut best_bw = 0.0f64;
+        let mut best_loss = hard_loss;
+        for &bw in &candidates {
+            restore(&mut self.trees);
+            self.soft_refit_at(
+                binned,
+                y,
+                n_rows,
+                x_data_raw,
+                n_features_original,
+                sample_weight,
+                init_score,
+                bw,
+                &feat_scales,
+            );
+            let loss = if have_eval {
+                self.soft_eval_loss(
+                    binned,
+                    eval_data,
+                    eval_init_score,
+                    bw,
+                    n_features_original,
+                    &feat_scales,
+                )
+            } else {
+                // No eval (fixed-bandwidth, no early stopping): accept the request.
+                f64::NEG_INFINITY
+            };
+            if loss < best_loss {
+                best_loss = loss;
+                best_bw = bw;
+            }
+        }
+
+        restore(&mut self.trees);
+        if best_bw > 0.0 {
+            self.soft_refit_at(
+                binned,
+                y,
+                n_rows,
+                x_data_raw,
+                n_features_original,
+                sample_weight,
+                init_score,
+                best_bw,
+                &feat_scales,
+            );
+            self.soft_predict_bandwidth = best_bw;
+        } else {
+            // Hard routing won (or no eval to justify soft): leave the model hard.
+            self.soft_predict_bandwidth = 0.0;
+        }
+    }
+
+    /// Per-feature raw-unit scale (avg bin width). Makes the soft-routing sigmoid
+    /// dimensionless / scale-invariant across features, matching predict-time SRP.
+    fn soft_feat_scales(&self, binned: &BinnedData, n_features_original: usize) -> Vec<f64> {
+        (0..n_features_original)
+            .map(|f| {
+                if f >= binned.bin_edges.len() {
+                    return 1.0;
+                }
+                let edges = &binned.bin_edges[f];
+                if edges.len() < 2 {
+                    1.0
+                } else {
+                    let range = edges[edges.len() - 1] - edges[0];
+                    let nb = edges.len() as f64;
+                    if range > 0.0 {
+                        range / nb
+                    } else {
+                        1.0
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// One cyclic coordinate-descent sweep set: refit every tree's constant leaves
+    /// under soft routing at `bw` on the shared residual. Mutates leaf values.
+    #[allow(clippy::too_many_arguments)]
+    fn soft_refit_at(
+        &mut self,
+        binned: &BinnedData,
+        y: &[f64],
+        n_rows: usize,
+        x_data_raw: &[f64],
+        n_features_original: usize,
+        sample_weight: Option<&[f64]>,
+        init_score: Option<&[f64]>,
+        bw: f64,
+        feat_scales: &[f64],
+    ) {
+        let all_indices: Vec<u32> = (0..n_rows as u32).collect();
+        let has_dart_w = !self.dart_tree_weights.is_empty();
+        let n_trees = self.trees.len();
+        let row_of = |i: usize| &x_data_raw[i * n_features_original..(i + 1) * n_features_original];
+
+        let mut soft_c: Vec<Vec<f64>> = vec![vec![0.0; n_rows]; n_trees];
+        let mut predictions = if let Some(s) = init_score {
+            s.to_vec()
+        } else {
+            vec![self.base_score; n_rows]
+        };
+        for t in 0..n_trees {
+            let w = if has_dart_w && t < self.dart_tree_weights.len() {
+                self.dart_tree_weights[t]
+            } else {
+                1.0
+            };
+            let scale = self.learning_rate * w;
+            for i in 0..n_rows {
+                let c = self.trees[t].predict_raw_row_soft(binned, row_of(i), bw, feat_scales);
+                soft_c[t][i] = c;
+                predictions[i] += scale * c;
+            }
+        }
+
+        let mut gradients = vec![0.0f64; n_rows];
+        let mut hessians = vec![0.0f64; n_rows];
+        let passes = self.soft_leaf_passes.max(1);
+        for _ in 0..passes {
+            for t in 0..n_trees {
+                let w = if has_dart_w && t < self.dart_tree_weights.len() {
+                    self.dart_tree_weights[t]
+                } else {
+                    1.0
+                };
+                let scale = self.learning_rate * w;
+                for i in 0..n_rows {
+                    predictions[i] -= scale * soft_c[t][i];
+                }
+                self.compute_gradients_hessians(y, &predictions, &mut gradients, &mut hessians);
+                Self::apply_sample_weights(sample_weight, &mut gradients, &mut hessians);
+                self.trees[t].refit_leaves_soft(
+                    binned,
+                    x_data_raw,
+                    n_features_original,
+                    &gradients,
+                    &hessians,
+                    &all_indices,
+                    self.lambda_reg,
+                    self.l1_reg,
+                    bw,
+                    feat_scales,
+                );
+                for i in 0..n_rows {
+                    let c = self.trees[t].predict_raw_row_soft(binned, row_of(i), bw, feat_scales);
+                    soft_c[t][i] = c;
+                    predictions[i] += scale * c;
+                }
+            }
+        }
+    }
+
+    /// Eval-set loss of the current trees under soft routing at `bw` (bw=0 = hard).
+    /// Used by AUTO bandwidth selection as a held-out no-regression guard.
+    fn soft_eval_loss(
+        &self,
+        binned: &BinnedData,
+        eval_data: &Option<(Vec<u16>, Vec<f64>, usize, Vec<f64>, Vec<u16>)>,
+        eval_init_score: Option<&[f64]>,
+        bw: f64,
+        n_features_original: usize,
+        feat_scales: &[f64],
+    ) -> f64 {
+        let Some((_, eval_y, en, eval_raw, _)) = eval_data else {
+            return f64::INFINITY;
+        };
+        let en = *en;
+        if en == 0 || eval_raw.len() != en * n_features_original {
+            return f64::INFINITY;
+        }
+        let has_dart_w = !self.dart_tree_weights.is_empty();
+        let mut preds = if let Some(s) = eval_init_score {
+            s.to_vec()
+        } else {
+            vec![self.base_score; en]
+        };
+        if preds.len() != en {
+            preds = vec![self.base_score; en];
+        }
+        for (t, tree) in self.trees.iter().enumerate() {
+            let w = if has_dart_w && t < self.dart_tree_weights.len() {
+                self.dart_tree_weights[t]
+            } else {
+                1.0
+            };
+            let scale = self.learning_rate * w;
+            for i in 0..en {
+                let raw_row = &eval_raw[i * n_features_original..(i + 1) * n_features_original];
+                let c = if bw > 0.0 {
+                    tree.predict_raw_row_soft(binned, raw_row, bw, feat_scales)
+                } else {
+                    tree.predict_raw_row(binned, raw_row)
+                };
+                preds[i] += scale * c;
+            }
+        }
+        self.compute_eval_loss(eval_y, &preds, en)
+    }
+
+    fn guard_leaf_linear_ramps(
+        &mut self,
+        binned: &BinnedData,
+        eval_data: &Option<(Vec<u16>, Vec<f64>, usize, Vec<f64>, Vec<u16>)>,
+        eval_init_score: Option<&[f64]>,
+        n_features_original: usize,
+    ) {
+        if !self.leaf_linear
+            || self.trees.is_empty()
+            || n_features_original == 0
+            || n_features_original != binned.n_features
+            || !self.trees.iter().any(|tree| !tree.ramp_slopes.is_empty())
+        {
+            return;
+        }
+        let have_eval = matches!(eval_data, Some((_, _, en, raw, _))
+            if *en > 0 && raw.len() == en * n_features_original);
+        if !have_eval {
+            return;
+        }
+
+        let feat_scales = self.soft_feat_scales(binned, n_features_original);
+        let with_loss = self.soft_eval_loss(
+            binned,
+            eval_data,
+            eval_init_score,
+            0.0,
+            n_features_original,
+            &feat_scales,
+        );
+        if !with_loss.is_finite() {
+            return;
+        }
+        let snapshot: Vec<Vec<f64>> = self
+            .trees
+            .iter()
+            .map(|tree| tree.ramp_slopes.clone())
+            .collect();
+        for tree in self.trees.iter_mut() {
+            tree.scale_ramp_slopes(0.0);
+        }
+        let without_loss = self.soft_eval_loss(
+            binned,
+            eval_data,
+            eval_init_score,
+            0.0,
+            n_features_original,
+            &feat_scales,
+        );
+        let min_improve = if let Some((_, eval_y, en, _, _)) = eval_data {
+            if self.task == "binary"
+                && matches!(
+                    self.eval_metric.to_ascii_lowercase().as_str(),
+                    "auc" | "roc_auc" | "1-auc"
+                )
+            {
+                let pos = eval_y.iter().take(*en).filter(|&&v| v > 0.5).count();
+                let neg = en.saturating_sub(pos);
+                1.0 / ((pos as f64) * (neg as f64)).max(1.0)
+            } else {
+                5e-4 * without_loss.abs().max(1e-12)
+            }
+        } else {
+            f64::INFINITY
+        };
+        if !without_loss.is_finite() || with_loss + min_improve < without_loss {
+            for (tree, slopes) in self.trees.iter_mut().zip(snapshot.into_iter()) {
+                tree.ramp_slopes = slopes;
+            }
+        }
     }
 
     fn fit_global_cat_offsets(
@@ -162,6 +916,7 @@ impl GTBoostModel {
         x_data_raw: &[f64], // raw training data for progressive interaction unlocking
         n_features_original: usize, // original feature count (before interactions)
         init_score: Option<&[f64]>, // optional per-row warm-start margin
+        eval_init_score: Option<&[f64]>, // optional eval warm-start margin
         sample_weight: Option<&[f64]>, // optional per-row gradient/hessian weights
     ) {
         let mut n_feat = n_features;
@@ -194,6 +949,7 @@ impl GTBoostModel {
         let self_score_active = self.self_score_splits
             && self.task != "poisson"
             && grow == "depthwise"
+            && !binned.is_categorical.iter().any(|&is_cat| is_cat)
             && self.dart_rate <= 0.0
             && self.refine_every == 0
             && self.n_refine == 0
@@ -217,8 +973,22 @@ impl GTBoostModel {
         // Early stopping state
         let eval_active = eval_data.is_some();
         let early_stop_active = self.early_stopping_rounds > 0;
-        let mut eval_preds: Vec<f64> = if let Some((_, _, en, _, _)) = eval_data {
-            vec![self.base_score; *en]
+        let mut eval_preds: Vec<f64> = if let Some((_, _, en, eval_raw, _)) = eval_data {
+            if let Some(s) = eval_init_score {
+                if s.len() == *en {
+                    s.to_vec()
+                } else {
+                    vec![self.base_score; *en]
+                }
+            } else if self.vertical_prior.is_active()
+                && !eval_raw.is_empty()
+                && eval_raw.len() == en.saturating_mul(n_features_original)
+            {
+                self.vertical_prior
+                    .predict_matrix(eval_raw, *en, n_features_original)
+            } else {
+                vec![self.base_score; *en]
+            }
         } else {
             Vec::new()
         };
@@ -235,17 +1005,11 @@ impl GTBoostModel {
             v
         };
 
-        // Cyclic features (EBM-style): one tree per feature per round
-        let n_sub = if self.cyclic_features {
-            let base = n_feat.max(1);
-            if self.adaptive_cyclic_order && self.cyclic_feature_reuse {
-                base + self.cyclic_revisit_budget()
-            } else {
-                base
-            }
-        } else {
-            self.n_trees_per_round
-        };
+        // Cyclic features (EBM-style): one feature-restricted tree at a time.
+        // A positive cap makes this a sparse vertical-attention pass: each
+        // boosting round spends trees only on the strongest residual-pressure
+        // features instead of forcing every feature to receive a tree.
+        let n_sub = self.subtrees_per_boosting_round(n_feat);
 
         // Progressive interaction unlocking: disabled (initial warmup at fit() start is sufficient)
         let interaction_rescore_interval: usize = 0;
@@ -352,6 +1116,50 @@ impl GTBoostModel {
         let rank_mix_start_frac = self.rank_mix_start_frac;
         let configured_binary_focus_gamma = self.binary_focus_gamma;
         let binary_focus_end_frac = self.binary_focus_end_frac;
+        binned.ensure_row_major_cache(); // one-pass node-hist kernel
+
+        // ── FOB (single-output): fold-ordered boosting for binary/regression.
+        // Each row's gradients come from an honest margin track whose leaf
+        // updates excluded the row's fold (CatBoost-style ordered boosting at
+        // fold granularity). Excluded when other margin-rewriting mechanisms
+        // (V-OB, NCL, DART) own the gradient bookkeeping.
+        let use_fob_so = self.fold_ordered >= 2
+            && self.task != "multiclass"
+            && !use_ordered
+            && self.ncl_lambda <= 0.0
+            && self.dart_rate <= 0.0
+            && n_rows >= 4 * self.fold_ordered;
+        let fob_f = if use_fob_so {
+            self.fold_ordered.min(n_rows / 2).max(2)
+        } else {
+            0
+        };
+        let fob_fold_of: Vec<u8> = if use_fob_so {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            let mut r = StdRng::seed_from_u64(self.seed.wrapping_add(77_178));
+            perm.shuffle(&mut r);
+            let mut fo = vec![0u8; n_rows];
+            for (rank, &row) in perm.iter().enumerate() {
+                fo[row] = (rank % fob_f) as u8;
+            }
+            fo
+        } else {
+            Vec::new()
+        };
+        let mut fob_preds: Vec<f64> = if use_fob_so {
+            let mut p = vec![0.0f64; fob_f * n_rows];
+            for fold in 0..fob_f {
+                p[fold * n_rows..(fold + 1) * n_rows].copy_from_slice(&predictions);
+            }
+            p
+        } else {
+            Vec::new()
+        };
+        let mut fob_honest: Vec<f64> = if use_fob_so {
+            vec![0.0f64; n_rows]
+        } else {
+            Vec::new()
+        };
         for round in 0..n_rounds {
             let progress = round as f64 / n_rounds.max(1) as f64;
             if let Some(score_idx) = self_score_feature {
@@ -475,6 +1283,12 @@ impl GTBoostModel {
                     &mut gradients,
                     &mut hessians,
                 );
+            } else if use_fob_so {
+                // FOB: gradients from honest fold-track margins.
+                for i in 0..n_rows {
+                    fob_honest[i] = fob_preds[fob_fold_of[i] as usize * n_rows + i];
+                }
+                self.compute_gradients_hessians(y, &fob_honest, &mut gradients, &mut hessians);
             } else {
                 self.compute_gradients_hessians(y, &predictions, &mut gradients, &mut hessians);
             }
@@ -597,23 +1411,71 @@ impl GTBoostModel {
                 }
             }
 
-            // Split-criterion transform: rank / sign replace gradients for split finding only.
-            // Leaves refit with original gradients below to keep leaf values in Newton scale.
-            let split_mode_active = self.split_criterion != "newton";
-            let split_owned = if split_mode_active {
-                transform_gradients_for_split(&gradients, &self.split_criterion)
+            // SR-discovered generic hard-residual focus. Unlike
+            // binary_focus_gamma this is objective-agnostic for binary and
+            // regression. In "full" mode it reweights the Newton surrogate.
+            // In "split_only" mode it only allocates tree structure toward
+            // hard residual regions; leaves are refit on the raw objective
+            // gradients below. Default alpha=0 recovers ordinary boosting.
+            let residual_focus_split_only = self.residual_focus_split_only()
+                && self.residual_focus_alpha > 0.0
+                && (self.task == "binary" || self.task == "regression");
+            let residual_focus_split_owned = if residual_focus_split_only {
+                let mut g = gradients.clone();
+                let mut h = hessians.clone();
+                self.apply_residual_focus(&mut g, &mut h);
+                Some((g, h))
             } else {
+                self.apply_residual_focus(&mut gradients, &mut hessians);
                 None
             };
-            let (g_split_ref, h_split_ref): (&[f64], &[f64]) =
-                if let Some((ref g, ref h)) = split_owned {
+            let (g_focus_ref, h_focus_ref): (&[f64], &[f64]) =
+                if let Some((ref g, ref h)) = residual_focus_split_owned {
                     (g.as_slice(), h.as_slice())
                 } else {
                     (&gradients, &hessians)
                 };
 
+            // Split-criterion transform: replace gradients for split finding
+            // only. Leaves refit with original gradients below to keep leaf
+            // values in Newton scale.
+            let split_mode_active = self.split_criterion != "newton" && grow == "depthwise";
+            let split_owned =
+                if split_mode_active && self.split_criterion == "auc" && self.task == "binary" {
+                    let mean_y = if n_rows > 0 {
+                        y.iter().sum::<f64>() / n_rows as f64
+                    } else {
+                        0.0
+                    };
+                    Some((
+                        y.iter().map(|&yi| yi - mean_y).collect::<Vec<f64>>(),
+                        vec![1.0f64; n_rows],
+                    ))
+                } else if split_mode_active {
+                    transform_gradients_for_split(g_focus_ref, &self.split_criterion)
+                } else {
+                    None
+                };
+            let (g_split_ref, h_split_ref): (&[f64], &[f64]) =
+                if let Some((ref g, ref h)) = split_owned {
+                    (g.as_slice(), h.as_slice())
+                } else {
+                    (g_focus_ref, h_focus_ref)
+                };
+
             // Build N trees per round (all see same gradients, different subsamples)
             let use_bayesian = self.bagging_temperature > 0.0;
+            let n_sub = if self.ncl_lambda > 0.0 && n_sub > 1 {
+                self.adaptive_subtree_count_by_pressure(
+                    binned,
+                    g_split_ref,
+                    h_split_ref,
+                    round_lambda,
+                    n_sub,
+                )
+            } else {
+                n_sub
+            };
 
             let sub_scale = if n_sub > 1 { 1.0 / n_sub as f64 } else { 1.0 };
 
@@ -627,6 +1489,18 @@ impl GTBoostModel {
             } else {
                 Vec::new()
             };
+            let main_effect_feature =
+                if !self.cyclic_features && n_feat > 0 && self.main_effect_due(round, n_rounds) {
+                    self.main_effect_feature_by_pressure(
+                        binned,
+                        g_split_ref,
+                        h_split_ref,
+                        round_lambda,
+                        self_score_feature,
+                    )
+                } else {
+                    None
+                };
 
             if n_sub > 1 && !use_bayesian && !use_ncl {
                 // ── Parallel path: build N independent trees concurrently ──
@@ -634,7 +1508,7 @@ impl GTBoostModel {
                 // Pre-generate per-subtree seeds so each thread has its own RNG
                 let sub_seeds: Vec<u64> = (0..n_sub).map(|_| rng.random()).collect();
 
-                let built_trees: Vec<(DecisionTree, Option<Vec<u64>>, Vec<u32>)> = sub_seeds
+                let built_trees: Vec<(DecisionTree, Option<Vec<u64>>, Vec<u32>, Vec<u32>)> = sub_seeds
                     .into_par_iter()
                     .enumerate()
                     .map(|(sub_idx, seed)| {
@@ -644,46 +1518,84 @@ impl GTBoostModel {
                         // + extra_trees across sub-trees. Each round contains 3+ architectural
                         // perspectives on the same residuals → automatic archetype mixing without
                         // dataset-profile hints. Requires n_sub >= 3.
-                        let (sub_depth, sub_lambda, sub_grow_override, sub_extra_trees) = if self
-                            .hetero_trees
-                            && n_sub >= 3
-                        {
-                            match sub_idx % 3 {
-                                // Variant A: standard depthwise, moderate params
-                                0 => (
-                                    phase_depth,
+                        let main_effect_tree = main_effect_feature.is_some() && sub_idx == 0;
+                        let (sub_depth, sub_lambda, sub_grow_override, sub_extra_trees) =
+                            if main_effect_tree {
+                                (
+                                    self.main_effect_depth.min(phase_depth).max(1),
                                     round_lambda,
                                     Some("depthwise"),
-                                    self.extra_trees,
-                                ),
-                                // Variant B: oblivious (symmetric), shallower, more reg
-                                1 => (
-                                    phase_depth.saturating_sub(1).max(2),
-                                    round_lambda * 2.0,
-                                    Some("oblivious"),
                                     false,
-                                ),
-                                // Variant C: deeper + RF-style random splits (extra_trees)
-                                2 => (phase_depth + 1, round_lambda * 0.5, Some("depthwise"), true),
-                                _ => (phase_depth, round_lambda, None, self.extra_trees),
-                            }
-                        } else {
-                            (phase_depth, round_lambda, None, self.extra_trees)
-                        };
+                                )
+                            } else if self.hetero_trees && n_sub >= 3 {
+                                match sub_idx % 3 {
+                                    // Variant A: standard depthwise, moderate params
+                                    0 => (
+                                        phase_depth,
+                                        round_lambda,
+                                        Some("depthwise"),
+                                        self.extra_trees,
+                                    ),
+                                    // Variant B: oblivious (symmetric), shallower, more reg
+                                    1 => (
+                                        phase_depth.saturating_sub(1).max(2),
+                                        round_lambda * 2.0,
+                                        Some("oblivious"),
+                                        false,
+                                    ),
+                                    // Variant C: deeper + RF-style random splits (extra_trees)
+                                    2 => (
+                                        phase_depth + 1,
+                                        round_lambda * 0.5,
+                                        Some("depthwise"),
+                                        true,
+                                    ),
+                                    _ => (phase_depth, round_lambda, None, self.extra_trees),
+                                }
+                            } else {
+                                (phase_depth, round_lambda, None, self.extra_trees)
+                            };
                         let sub_grow = sub_grow_override.unwrap_or(grow);
+                        let sub_depth = adaptive_soft_depth_limit(sub_grow, sub_depth);
 
                         // Cyclic features: each sub-tree gets exactly one feature
-                        let feature_mask = if self.cyclic_features {
+                        let feature_mask = if let Some(feat) =
+                            main_effect_feature.filter(|_| main_effect_tree)
+                        {
+                            let mut mask = vec![false; n_feat];
+                            if feat < n_feat {
+                                mask[feat] = true;
+                            }
+                            mask
+                        } else if self.cyclic_features {
                             let mut mask = vec![false; n_feat];
                             if n_feat > 0 {
                                 let feat = cyclic_round_order
                                     .get(sub_idx)
                                     .copied()
-                                    .unwrap_or((round + sub_idx) % n_feat);
+                                    .unwrap_or((round * n_sub + sub_idx) % n_feat);
                                 // Rotate the feature order across boosting rounds. With sibling
                                 // feedback enabled, this avoids always giving low-index features
                                 // stale residuals and high-index features fully updated residuals.
                                 mask[feat] = true;
+                                // CIPA partner (GA2M pair shapes). This parallel path is the
+                                // one cyclic rounds actually take (subtrees_per_boosting_round
+                                // returns n_feat when cyclic), so the partner must be applied
+                                // HERE — the sequential-path copy only runs under ncl/bayesian
+                                // bagging and left the option inert. Depth-1 trees cannot form
+                                // a pair (single split), so the mains phase of a phase_schedule
+                                // stays pure single-feature shapes.
+                                if self.cyclic_partner_features && phase_depth >= 2 {
+                                    if let Some(partner) = self.best_cyclic_partner_by_pair_pressure(
+                                        binned,
+                                        feat,
+                                        g_split_ref,
+                                        h_split_ref,
+                                        round_lambda,
+                                    ) {
+                                        mask[partner] = true;
+                                    }
+                                }
                             }
                             mask
                         } else {
@@ -693,6 +1605,33 @@ impl GTBoostModel {
                         let sample_indices = planned_subsamples[sub_idx].clone();
 
                         let need_oob_mask = self.ordered_boost && self.subsample_rate < 1.0;
+                        let explicit_split_audit =
+                            self.split_audit_fraction > 0.0 && self.complement_debias_mode > 0;
+                        let split_audit_fraction = if explicit_split_audit {
+                            self.split_audit_fraction
+                        } else {
+                            self.auto_split_audit_fraction(
+                                binned,
+                                sample_indices.len(),
+                                sub_grow,
+                                sub_extra_trees,
+                            )
+                        };
+                        let split_audit_mode = if self.honest {
+                            self.complement_debias_mode
+                        } else if explicit_split_audit {
+                            self.complement_debias_mode
+                        } else if split_audit_fraction > 0.0 {
+                            2
+                        } else {
+                            0
+                        };
+                        let split_audit_active = !self.honest
+                            && split_audit_fraction > 0.0
+                            && split_audit_mode > 0
+                            && sub_grow == "depthwise"
+                            && !sub_extra_trees
+                            && sample_indices.len() >= 32;
                         let (structure_indices, estimation_indices, in_sample) = if self.honest {
                             if self.honest_fraction <= 0.0 && self.subsample_rate < 1.0 {
                                 let mut in_s = bitvec_new(n_rows);
@@ -711,6 +1650,26 @@ impl GTBoostModel {
                                 let mid = shuffled.len() - est_size;
                                 (shuffled[..mid].to_vec(), shuffled[mid..].to_vec(), None)
                             }
+                        } else if split_audit_active {
+                            let mut shuffled = sample_indices;
+                            shuffled.shuffle(&mut sub_rng);
+                            let audit_size = ((shuffled.len() as f64
+                                * split_audit_fraction.clamp(0.1, 0.5))
+                            .round() as usize)
+                                .clamp(8, shuffled.len().saturating_sub(8));
+                            let mid = shuffled.len().saturating_sub(audit_size);
+                            let build = shuffled[..mid].to_vec();
+                            let audit = shuffled[mid..].to_vec();
+                            let in_s = if need_oob_mask {
+                                let mut m = bitvec_new(n_rows);
+                                for &idx in build.iter().chain(audit.iter()) {
+                                    bitvec_set(&mut m, idx as usize);
+                                }
+                                Some(m)
+                            } else {
+                                None
+                            };
+                            (build, audit, in_s)
                         } else if need_oob_mask {
                             let mut in_s = bitvec_new(n_rows);
                             for &idx in &sample_indices {
@@ -723,8 +1682,8 @@ impl GTBoostModel {
                         let build_indices = &structure_indices;
 
                         let tree_seed: u64 = sub_rng.random();
-                        let use_cdss = self.honest
-                            && self.complement_debias_mode > 0
+                        let use_cdss = (self.honest || split_audit_active)
+                            && split_audit_mode > 0
                             && sub_grow == "depthwise"
                             && !sub_extra_trees
                             && !estimation_indices.is_empty();
@@ -734,13 +1693,15 @@ impl GTBoostModel {
                             self.cat_lookup_smooth
                         };
 
+                        let mut row_leaves_buf: Vec<u32> = Vec::new();
                         let mut tree = match sub_grow {
-                            "leafwise" => DecisionTree::build_leafwise(
+                            "leafwise" | "trunk1_balanced" => DecisionTree::build_leafwise(
                                 binned,
                                 g_split_ref,
                                 h_split_ref,
                                 build_indices,
                                 sub_lambda,
+                                self.l1_reg,
                                 self.gamma,
                                 sub_depth,
                                 max_leaves,
@@ -754,6 +1715,11 @@ impl GTBoostModel {
                                 &mono_cstr,
                                 self.gain_penalty,
                                 sub_extra_trees,
+                                self.sparse_oblique_splits,
+                                self.interval_splits,
+                                false,
+                                sub_grow == "trunk1_balanced",
+                                self.leaf_var_shrink,
                                 CatPairConfig {
                                     enabled: self.jit_catpair_enabled,
                                     top_k_cat: self.jit_catpair_top_k,
@@ -762,6 +1728,7 @@ impl GTBoostModel {
                                     max_node_depth: self.jit_catpair_max_node_depth,
                                     gain_margin: self.jit_catpair_gain_margin,
                                 },
+                                Some(&mut row_leaves_buf),
                             ),
                             "oblivious" => DecisionTree::build_oblivious(
                                 binned,
@@ -769,6 +1736,7 @@ impl GTBoostModel {
                                 h_split_ref,
                                 build_indices,
                                 sub_lambda,
+                                self.l1_reg,
                                 self.gamma,
                                 sub_depth,
                                 self.min_child_weight,
@@ -776,6 +1744,7 @@ impl GTBoostModel {
                                 self.gain_penalty,
                                 sub_extra_trees,
                                 tree_seed,
+                                self.leaf_var_shrink,
                             ),
                             _ if use_cdss => DecisionTree::build_depthwise_debiased(
                                 binned,
@@ -796,7 +1765,7 @@ impl GTBoostModel {
                                 &mono_cstr,
                                 self.gain_penalty,
                                 sub_extra_trees,
-                                self.complement_debias_mode,
+                                split_audit_mode,
                                 self.lookahead_alpha,
                                 self.adaptive_leaf_experts
                                     || self.leaf_linear
@@ -828,6 +1797,8 @@ impl GTBoostModel {
                                 self.sparse_oblique_splits,
                                 self.interval_splits,
                                 None,
+                                sub_grow == "adaptive",
+                                self.leaf_var_shrink,
                                 CatPairConfig {
                                     enabled: self.jit_catpair_enabled,
                                     top_k_cat: self.jit_catpair_top_k,
@@ -836,18 +1807,60 @@ impl GTBoostModel {
                                     max_node_depth: self.jit_catpair_max_node_depth,
                                     gain_margin: self.jit_catpair_gain_margin,
                                 },
+                                if self.honest_arbitration && self.honest && !estimation_indices.is_empty() {
+                                    Some(estimation_indices.as_slice())
+                                } else {
+                                    None
+                                },
+                            
+                                if self.feature_gain_prior.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.feature_gain_prior.as_slice())
+                                },
+                            
+                                self.thermal,
+                            
+                                self.thermal_n_exp,
+                                self.thermal_depth_gamma,
                             ),
                         };
 
+                        // SP-GBDT (Stein-projected leaves): joint positive-part shrinkage of
+                        // the tree's leaf vector at the estimated gradient-noise scale.
+                        // Skipped under honest/refit modes (they re-estimate leaves later).
+                        if self.stein_leaves && !self.honest {
+                            Self::apply_stein_leaves(
+                                &mut tree,
+                                binned,
+                                g_split_ref,
+                                h_split_ref,
+                                build_indices,
+                                sub_lambda,
+                                self.task != "regression",
+                                self.stein_levels,
+                            );
+                        }
+
                         // Rank/sign split mode: tree was built with transformed gradients,
-                        // so leaf values are in rank/sign scale. ALWAYS refit on original
-                        // gradients to reset leaves to Newton scale before any honest_tau blend.
-                        if split_mode_active {
+                        // so leaf values are in rank/sign scale. Audit-only split scoring
+                        // also builds structure on a subset; after selecting structure,
+                        // refit leaves on the whole sampled rows.
+                        if split_mode_active || split_audit_active || residual_focus_split_only {
+                            let refit_indices = if split_audit_active {
+                                structure_indices
+                                    .iter()
+                                    .chain(estimation_indices.iter())
+                                    .copied()
+                                    .collect::<Vec<u32>>()
+                            } else {
+                                build_indices.to_vec()
+                            };
                             tree.refit_leaves_l1(
                                 binned,
                                 &gradients,
                                 &hessians,
-                                build_indices,
+                                &refit_indices,
                                 sub_lambda,
                                 self.l1_reg,
                             );
@@ -886,7 +1899,7 @@ impl GTBoostModel {
                             || self.leaf_median
                             || self.leaf_median_blend > 0.0
                             || self.leaf_mad_clip > 0.0
-                            || self.leaf_adaptive_blend_kappa > 0.0
+                            || self.leaf_adaptive_blend_kappa != 0.0
                         {
                             // Non-honest + trim: post-build robust refit on structure indices.
                             // Keeps gradient scale intact, only M-estimators leaf values.
@@ -951,7 +1964,7 @@ impl GTBoostModel {
                         } else {
                             structure_indices
                         };
-                        (tree, in_sample, leaf_indices)
+                        (tree, in_sample, leaf_indices, row_leaves_buf)
                     })
                     .collect();
 
@@ -962,7 +1975,7 @@ impl GTBoostModel {
                     1.0
                 };
 
-                for (mut tree, in_sample, leaf_indices) in built_trees {
+                for (mut tree, in_sample, leaf_indices, row_leaves_buf) in built_trees {
                     if lr_factor < 1.0 {
                         for v in tree.values.iter_mut() {
                             *v *= lr_factor;
@@ -998,6 +2011,16 @@ impl GTBoostModel {
                         if posterior_tau > 0.0 {
                             tree.posterior_shrink_leaves(posterior_tau);
                         }
+                        self.apply_eblp(&mut tree);
+                        self.apply_hss(&mut tree);
+                        self.apply_scs(&mut tree, binned, &gradients, n_rows);
+                        self.apply_newton_trust_region(&mut tree);
+                        self.gate_leaf_lookups_by_eval(
+                            &mut tree,
+                            eval_data.as_ref(),
+                            &eval_preds,
+                            effective_lr,
+                        );
                         tree.add_predictions_loo(
                             binned,
                             &mut predictions,
@@ -1012,7 +2035,41 @@ impl GTBoostModel {
                         if posterior_tau > 0.0 {
                             tree.posterior_shrink_leaves(posterior_tau);
                         }
-                        tree.add_predictions_binned(binned, &mut predictions, effective_lr);
+                        self.apply_eblp(&mut tree);
+                        self.apply_hss(&mut tree);
+                        self.apply_scs(&mut tree, binned, &gradients, n_rows);
+                        self.apply_newton_trust_region(&mut tree);
+                        self.gate_leaf_lookups_by_eval(
+                            &mut tree,
+                            eval_data.as_ref(),
+                            &eval_preds,
+                            effective_lr,
+                        );
+                        if !row_leaves_buf.is_empty() {
+                            // Fused: builder already routed every row.
+                            tree.add_predictions_from_leaves(
+                                binned,
+                                &row_leaves_buf,
+                                &mut predictions,
+                                effective_lr,
+                            );
+                        } else {
+                            tree.add_predictions_binned(binned, &mut predictions, effective_lr);
+                        }
+                        if use_fob_so {
+                            fob_update_tracks_single(
+                                &tree,
+                                binned,
+                                &gradients,
+                                &hessians,
+                                &fob_fold_of,
+                                fob_f,
+                                round_lambda,
+                                effective_lr,
+                                &row_leaves_buf,
+                                &mut fob_preds,
+                            );
+                        }
                     }
 
                     // Leaf correction: recompute gradients and refit leaf values
@@ -1053,6 +2110,14 @@ impl GTBoostModel {
                                     self.cat_lookup_smooth,
                                     self.adaptive_cat_lookup_smooth,
                                     cat_tuple_cfg.as_ref(),
+                                );
+                            }
+                            if self.leaf_var_shrink > 0.0 {
+                                tree.shrink_leaves_by_gradient_reliability(
+                                    binned,
+                                    &gradients,
+                                    &all_indices,
+                                    self.leaf_var_shrink,
                                 );
                             }
                             tree.add_predictions_binned(binned, &mut predictions, lr);
@@ -1102,10 +2167,6 @@ impl GTBoostModel {
                         dart_tree_preds.push(tp);
                     }
                     self.dart_tree_weights.push(dart_new_w);
-                    self.apply_eblp(&mut tree);
-                    self.apply_hss(&mut tree);
-                    self.apply_scs(&mut tree, binned, &gradients, n_rows);
-                    self.apply_newton_trust_region(&mut tree);
                     // V-OB: accumulate per-row OOB predictions AND squared predictions
                     // for variance estimation. Gate via reliability at gradient-compute time.
                     if use_ordered {
@@ -1222,7 +2283,29 @@ impl GTBoostModel {
                     };
 
                     let mut root_anchor_feature: Option<usize> = None;
-                    let feature_mask = if self.cyclic_features {
+                    let main_effect_tree = main_effect_feature.is_some() && _sub_idx == 0;
+                    let sub_depth = if main_effect_tree {
+                        self.main_effect_depth.min(phase_depth).max(1)
+                    } else {
+                        phase_depth
+                    };
+                    let sub_lambda = round_lambda;
+                    let sub_grow = if main_effect_tree { "depthwise" } else { grow };
+                    let sub_depth = adaptive_soft_depth_limit(sub_grow, sub_depth);
+                    let sub_extra_trees = if main_effect_tree {
+                        false
+                    } else {
+                        self.extra_trees
+                    };
+                    let feature_mask = if let Some(feat) =
+                        main_effect_feature.filter(|_| main_effect_tree)
+                    {
+                        let mut mask = vec![false; n_feat];
+                        if feat < n_feat {
+                            mask[feat] = true;
+                        }
+                        mask
+                    } else if self.cyclic_features {
                         let mut mask = vec![false; n_feat];
                         if n_feat > 0 {
                             let feat = if self.adaptive_cyclic_order {
@@ -1252,7 +2335,7 @@ impl GTBoostModel {
                                             &hessians,
                                             round_lambda,
                                         )
-                                        .unwrap_or((round + _sub_idx) % n_feat);
+                                        .unwrap_or((round * n_sub + _sub_idx) % n_feat);
                                     cyclic_last_feature = Some(selected);
                                     selected
                                 } else {
@@ -1264,7 +2347,7 @@ impl GTBoostModel {
                                             &hessians,
                                             round_lambda,
                                         )
-                                        .unwrap_or((round + _sub_idx) % n_feat);
+                                        .unwrap_or((round * n_sub + _sub_idx) % n_feat);
                                     if self.cyclic_feature_reuse && selected < cyclic_usage.len() {
                                         cyclic_usage[selected] += 1;
                                         cyclic_last_feature = Some(selected);
@@ -1272,7 +2355,7 @@ impl GTBoostModel {
                                     selected
                                 }
                             } else {
-                                (round + _sub_idx) % n_feat
+                                (round * n_sub + _sub_idx) % n_feat
                             };
                             // Rotate the feature order across boosting rounds. With sibling
                             // feedback enabled, every feature periodically gets early, middle,
@@ -1334,6 +2417,33 @@ impl GTBoostModel {
                     let mut expert_calibration_indices: Vec<u32> = Vec::new();
                     let use_expert_admission_tree =
                         self.should_use_expert_leaf_admission(binned) && !use_bayesian && !goss_on;
+                    let explicit_split_audit =
+                        self.split_audit_fraction > 0.0 && self.complement_debias_mode > 0;
+                    let split_audit_fraction = if explicit_split_audit {
+                        self.split_audit_fraction
+                    } else {
+                        self.auto_split_audit_fraction(
+                            binned,
+                            indices.len(),
+                            sub_grow,
+                            sub_extra_trees,
+                        )
+                    };
+                    let split_audit_mode = if self.honest {
+                        self.complement_debias_mode
+                    } else if explicit_split_audit {
+                        self.complement_debias_mode
+                    } else if split_audit_fraction > 0.0 {
+                        2
+                    } else {
+                        0
+                    };
+                    let split_audit_active = !self.honest
+                        && split_audit_fraction > 0.0
+                        && split_audit_mode > 0
+                        && sub_grow == "depthwise"
+                        && !sub_extra_trees
+                        && indices.len() >= 32;
                     let (structure_indices, estimation_indices) = if self.honest {
                         if self.honest_fraction <= 0.0 && self.subsample_rate < 1.0 {
                             let mut in_sample = bitvec_new(n_rows);
@@ -1357,6 +2467,16 @@ impl GTBoostModel {
                             let ei = shuffled[mid..].to_vec();
                             (si, ei)
                         }
+                    } else if split_audit_active {
+                        let mut shuffled = indices.clone();
+                        shuffled.shuffle(&mut rng);
+                        let frac = split_audit_fraction.clamp(0.1, 0.5);
+                        let audit_size = ((shuffled.len() as f64 * frac).round() as usize)
+                            .clamp(8, shuffled.len().saturating_sub(8));
+                        let mid = shuffled.len().saturating_sub(audit_size);
+                        let si = shuffled[..mid].to_vec();
+                        let ei = shuffled[mid..].to_vec();
+                        (si, ei)
                     } else if use_expert_admission_tree {
                         if let Some((build, cal)) =
                             self.vceg_partition_indices(&indices, round, _sub_idx)
@@ -1386,8 +2506,37 @@ impl GTBoostModel {
                     // path recomputes gradients after each sibling tree. Split search
                     // must therefore read the current gradients, not the stale
                     // per-round snapshot used by the parallel same-gradient path.
-                    let split_local = if split_mode_active {
-                        transform_gradients_for_split(&gradients, &self.split_criterion)
+                    let sub_split_mode_active = split_mode_active && sub_grow == "depthwise";
+                    let residual_focus_local = if residual_focus_split_only {
+                        let mut g = gradients.clone();
+                        let mut h = hessians.clone();
+                        self.apply_residual_focus(&mut g, &mut h);
+                        Some((g, h))
+                    } else {
+                        None
+                    };
+                    let (g_local_focus_ref, h_local_focus_ref): (&[f64], &[f64]) =
+                        if let Some((ref g, ref h)) = residual_focus_local {
+                            (g.as_slice(), h.as_slice())
+                        } else {
+                            (&gradients, &hessians)
+                        };
+
+                    let split_local = if sub_split_mode_active
+                        && self.split_criterion == "auc"
+                        && self.task == "binary"
+                    {
+                        let mean_y = if n_rows > 0 {
+                            y.iter().sum::<f64>() / n_rows as f64
+                        } else {
+                            0.0
+                        };
+                        Some((
+                            y.iter().map(|&yi| yi - mean_y).collect::<Vec<f64>>(),
+                            vec![1.0f64; n_rows],
+                        ))
+                    } else if sub_split_mode_active {
+                        transform_gradients_for_split(g_local_focus_ref, &self.split_criterion)
                     } else {
                         None
                     };
@@ -1395,14 +2544,14 @@ impl GTBoostModel {
                         if let Some((ref g, ref h)) = split_local {
                             (g.as_slice(), h.as_slice())
                         } else {
-                            (&gradients, &hessians)
+                            (g_local_focus_ref, h_local_focus_ref)
                         };
 
                     let tree_seed: u64 = rng.random();
-                    let use_cdss = self.honest
-                        && self.complement_debias_mode > 0
-                        && grow == "depthwise"
-                        && !self.extra_trees
+                    let use_cdss = (self.honest || split_audit_active)
+                        && split_audit_mode > 0
+                        && sub_grow == "depthwise"
+                        && !sub_extra_trees
                         && !estimation_indices.is_empty();
                     let lookup_smooth_build = if self.adaptive_leaf_experts {
                         0.0
@@ -1410,15 +2559,17 @@ impl GTBoostModel {
                         self.cat_lookup_smooth
                     };
 
-                    let mut tree = match grow {
-                        "leafwise" => DecisionTree::build_leafwise(
+                    let mut row_leaves_buf: Vec<u32> = Vec::new();
+                    let mut tree = match sub_grow {
+                        "leafwise" | "trunk1_balanced" => DecisionTree::build_leafwise(
                             binned,
                             g_build_ref,
                             h_build_ref,
                             build_indices,
-                            round_lambda,
+                            sub_lambda,
+                            self.l1_reg,
                             self.gamma,
-                            phase_depth,
+                            sub_depth,
                             max_leaves,
                             self.min_child_weight,
                             &feature_mask,
@@ -1429,29 +2580,37 @@ impl GTBoostModel {
                             lookup_smooth_build,
                             &mono_cstr,
                             self.gain_penalty,
-                            self.extra_trees,
+                            sub_extra_trees,
+                            self.sparse_oblique_splits && !main_effect_tree,
+                            self.interval_splits,
+                            false,
+                            sub_grow == "trunk1_balanced",
+                            self.leaf_var_shrink,
                             CatPairConfig {
-                                enabled: self.jit_catpair_enabled,
+                                enabled: self.jit_catpair_enabled && !main_effect_tree,
                                 top_k_cat: self.jit_catpair_top_k,
                                 k_buckets: self.jit_catpair_k_buckets,
                                 min_node_rows: self.jit_catpair_min_node_rows,
                                 max_node_depth: self.jit_catpair_max_node_depth,
                                 gain_margin: self.jit_catpair_gain_margin,
                             },
+                            Some(&mut row_leaves_buf),
                         ),
                         "oblivious" => DecisionTree::build_oblivious(
                             binned,
                             g_build_ref,
                             h_build_ref,
                             build_indices,
-                            round_lambda,
+                            sub_lambda,
+                            self.l1_reg,
                             self.gamma,
-                            phase_depth,
+                            sub_depth,
                             self.min_child_weight,
                             &feature_mask,
                             self.gain_penalty,
-                            self.extra_trees,
+                            sub_extra_trees,
                             tree_seed,
+                            self.leaf_var_shrink,
                         ),
                         _ if use_cdss => DecisionTree::build_depthwise_debiased(
                             binned,
@@ -1459,9 +2618,9 @@ impl GTBoostModel {
                             h_build_ref,
                             build_indices,
                             &estimation_indices,
-                            round_lambda,
+                            sub_lambda,
                             self.gamma,
-                            phase_depth,
+                            sub_depth,
                             self.min_child_weight,
                             &feature_mask,
                             self.colsample_bylevel,
@@ -1471,8 +2630,8 @@ impl GTBoostModel {
                             lookup_smooth_build,
                             &mono_cstr,
                             self.gain_penalty,
-                            self.extra_trees,
-                            self.complement_debias_mode,
+                            sub_extra_trees,
+                            split_audit_mode,
                             self.lookahead_alpha,
                             self.adaptive_leaf_experts
                                 || self.leaf_linear
@@ -1483,10 +2642,10 @@ impl GTBoostModel {
                             g_build_ref,
                             h_build_ref,
                             build_indices,
-                            round_lambda,
+                            sub_lambda,
                             self.l1_reg,
                             self.gamma,
-                            phase_depth,
+                            sub_depth,
                             self.min_child_weight,
                             &feature_mask,
                             self.colsample_bylevel,
@@ -1496,34 +2655,71 @@ impl GTBoostModel {
                             self.cat_lookup_smooth,
                             &mono_cstr,
                             self.gain_penalty,
-                            self.extra_trees,
+                            sub_extra_trees,
                             self.lookahead_alpha,
                             self.adaptive_leaf_experts
                                 || self.leaf_linear
                                 || self.cat_lookup_smooth > 0.0,
-                            self.sparse_oblique_splits,
+                            self.sparse_oblique_splits && !main_effect_tree,
                             self.interval_splits,
                             root_anchor_feature,
+                            sub_grow == "adaptive",
+                            self.leaf_var_shrink,
                             CatPairConfig {
-                                enabled: self.jit_catpair_enabled,
+                                enabled: self.jit_catpair_enabled && !main_effect_tree,
                                 top_k_cat: self.jit_catpair_top_k,
                                 k_buckets: self.jit_catpair_k_buckets,
                                 min_node_rows: self.jit_catpair_min_node_rows,
                                 max_node_depth: self.jit_catpair_max_node_depth,
                                 gain_margin: self.jit_catpair_gain_margin,
                             },
-                        ),
+                            if self.honest_arbitration && self.honest && !estimation_indices.is_empty() {
+                                    Some(estimation_indices.as_slice())
+                                } else {
+                                    None
+                                },
+                            
+                                if self.feature_gain_prior.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.feature_gain_prior.as_slice())
+                                },
+                            
+                                self.thermal,
+                            
+                                self.thermal_n_exp,
+                                self.thermal_depth_gamma,
+                            ),
                     };
 
-                    // Rank/sign split mode: always refit on original gradients to reset
-                    // leaves to Newton scale before any honest_tau blend.
-                    if split_mode_active {
-                        tree.refit_leaves_l1(
+                    // SP-GBDT (Stein-projected leaves) — see sequential path note.
+                    if self.stein_leaves && !self.honest {
+                        Self::apply_stein_leaves(
+                            &mut tree,
                             binned,
                             &gradients,
                             &hessians,
                             build_indices,
-                            round_lambda,
+                            sub_lambda,
+                            self.task != "regression",
+                            self.stein_levels,
+                        );
+                    }
+
+                    // Rank/sign split mode: always refit on original gradients to reset
+                    // leaves to Newton scale before any honest_tau blend.
+                    if sub_split_mode_active || split_audit_active || residual_focus_split_only {
+                        let refit_indices = if split_audit_active {
+                            indices.as_slice()
+                        } else {
+                            build_indices
+                        };
+                        tree.refit_leaves_l1(
+                            binned,
+                            &gradients,
+                            &hessians,
+                            refit_indices,
+                            sub_lambda,
                             self.l1_reg,
                         );
                     }
@@ -1544,7 +2740,7 @@ impl GTBoostModel {
                             &gradients,
                             &hessians,
                             &estimation_indices,
-                            round_lambda,
+                            sub_lambda,
                             self.honest_tau,
                             self.leaf_trim_pct,
                             self.leaf_median,
@@ -1555,14 +2751,14 @@ impl GTBoostModel {
 
                         if self.cat_lookup_smooth > 0.0
                             && !self.adaptive_leaf_experts
-                            && grow != "oblivious"
+                            && sub_grow != "oblivious"
                         {
                             tree.refit_cat_lookups(
                                 binned,
                                 &gradients,
                                 &hessians,
                                 &estimation_indices,
-                                round_lambda,
+                                sub_lambda,
                                 self.cat_lookup_smooth,
                                 self.min_child_weight,
                             );
@@ -1571,7 +2767,7 @@ impl GTBoostModel {
                         || self.leaf_median
                         || self.leaf_median_blend > 0.0
                         || self.leaf_mad_clip > 0.0
-                        || self.leaf_adaptive_blend_kappa > 0.0
+                        || self.leaf_adaptive_blend_kappa != 0.0
                     {
                         // Non-honest + trim: post-build robust refit on structure indices.
                         tree.refit_leaves_robust(
@@ -1579,7 +2775,7 @@ impl GTBoostModel {
                             &gradients,
                             &hessians,
                             build_indices,
-                            round_lambda,
+                            sub_lambda,
                             0.0,
                             self.leaf_trim_pct,
                             self.leaf_median,
@@ -1601,21 +2797,21 @@ impl GTBoostModel {
                                 &gradients,
                                 &hessians,
                                 lookup_indices,
-                                round_lambda,
+                                sub_lambda,
                                 self.gamma,
                                 self.min_child_weight,
                                 self.cat_lookup_smooth,
                                 self.adaptive_cat_lookup_smooth,
                                 cat_tuple_cfg.as_ref(),
                             );
-                        } else if grow == "oblivious" {
+                        } else if sub_grow == "oblivious" {
                             // Oblivious trees never install lookups during structure building.
                             tree.install_cat_lookups(
                                 binned,
                                 &gradients,
                                 &hessians,
                                 build_indices,
-                                round_lambda,
+                                sub_lambda,
                                 self.gamma,
                                 self.min_child_weight,
                                 self.cat_lookup_smooth,
@@ -1681,13 +2877,23 @@ impl GTBoostModel {
                         if posterior_tau > 0.0 {
                             tree.posterior_shrink_leaves(posterior_tau);
                         }
+                        self.apply_eblp(&mut tree);
+                        self.apply_hss(&mut tree);
+                        self.apply_scs(&mut tree, binned, &gradients, n_rows);
+                        self.apply_newton_trust_region(&mut tree);
+                        self.gate_leaf_lookups_by_eval(
+                            &mut tree,
+                            eval_data.as_ref(),
+                            &eval_preds,
+                            effective_lr,
+                        );
                         tree.add_predictions_loo(
                             binned,
                             &mut predictions,
                             effective_lr,
                             &gradients,
                             &hessians,
-                            round_lambda,
+                            sub_lambda,
                             loo_indices,
                             posterior_tau,
                         );
@@ -1695,7 +2901,41 @@ impl GTBoostModel {
                         if posterior_tau > 0.0 {
                             tree.posterior_shrink_leaves(posterior_tau);
                         }
-                        tree.add_predictions_binned(binned, &mut predictions, effective_lr);
+                        self.apply_eblp(&mut tree);
+                        self.apply_hss(&mut tree);
+                        self.apply_scs(&mut tree, binned, &gradients, n_rows);
+                        self.apply_newton_trust_region(&mut tree);
+                        self.gate_leaf_lookups_by_eval(
+                            &mut tree,
+                            eval_data.as_ref(),
+                            &eval_preds,
+                            effective_lr,
+                        );
+                        if !row_leaves_buf.is_empty() {
+                            // Fused: builder already routed every row.
+                            tree.add_predictions_from_leaves(
+                                binned,
+                                &row_leaves_buf,
+                                &mut predictions,
+                                effective_lr,
+                            );
+                        } else {
+                            tree.add_predictions_binned(binned, &mut predictions, effective_lr);
+                        }
+                        if use_fob_so {
+                            fob_update_tracks_single(
+                                &tree,
+                                binned,
+                                &gradients,
+                                &hessians,
+                                &fob_fold_of,
+                                fob_f,
+                                round_lambda,
+                                effective_lr,
+                                &row_leaves_buf,
+                                &mut fob_preds,
+                            );
+                        }
                     }
 
                     // Leaf correction: recompute gradients and refit leaf values
@@ -1721,7 +2961,7 @@ impl GTBoostModel {
                                 &corr_grads,
                                 &corr_hess,
                                 &all_indices,
-                                round_lambda,
+                                sub_lambda,
                                 self.l1_reg,
                             );
                             if self.adaptive_leaf_experts && self.cat_lookup_smooth > 0.0 {
@@ -1730,12 +2970,20 @@ impl GTBoostModel {
                                     &corr_grads,
                                     &corr_hess,
                                     &all_indices,
-                                    round_lambda,
+                                    sub_lambda,
                                     self.gamma,
                                     self.min_child_weight,
                                     self.cat_lookup_smooth,
                                     self.adaptive_cat_lookup_smooth,
                                     cat_tuple_cfg.as_ref(),
+                                );
+                            }
+                            if self.leaf_var_shrink > 0.0 {
+                                tree.shrink_leaves_by_gradient_reliability(
+                                    binned,
+                                    &gradients,
+                                    &all_indices,
+                                    self.leaf_var_shrink,
                                 );
                             }
                             tree.add_predictions_binned(binned, &mut predictions, lr);
@@ -1802,10 +3050,6 @@ impl GTBoostModel {
                     }
 
                     self.dart_tree_weights.push(dart_new_w);
-                    self.apply_eblp(&mut tree);
-                    self.apply_hss(&mut tree);
-                    self.apply_scs(&mut tree, binned, &gradients, n_rows);
-                    self.apply_newton_trust_region(&mut tree);
                     if use_ordered {
                         if let Some(ref mask) = seq_in_sample {
                             for i in 0..n_rows {
@@ -1933,7 +3177,11 @@ impl GTBoostModel {
                             ((a as usize, b as usize), count * (imp_a * imp_b).sqrt())
                         })
                         .collect();
-                    new_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    new_pairs.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
                     new_pairs.truncate(remaining_budget.min(5)); // unlock at most 5 new pairs per interval
 
                     if !new_pairs.is_empty() {
@@ -2169,6 +3417,24 @@ impl GTBoostModel {
             self.prune_similar_leaves();
         }
 
+        // Leaf-linear slopes are high-capacity local corrections. Keep them only
+        // if the held-out path agrees they improve the selected model; otherwise
+        // fall back to the same tree structure with constant leaves.
+        self.guard_leaf_linear_ramps(binned, eval_data, eval_init_score, n_features_original);
+
+        // ── Phase 4: Smooth Consistent Boosting (optional) ───────────────
+        self.soft_consistent_refit(
+            binned,
+            y,
+            n_rows,
+            x_data_raw,
+            n_features_original,
+            sample_weight,
+            init_score,
+            eval_data,
+            eval_init_score,
+        );
+
         self.fit_global_cat_offsets(
             binned,
             y,
@@ -2177,5 +3443,56 @@ impl GTBoostModel {
             n_features_original,
             sample_weight,
         );
+    }
+}
+
+/// FOB single-output: advance every honest fold track with COMPLEMENT-fold
+/// Newton leaf values for the freshly built tree. Track f's update for a leaf
+/// uses only rows outside fold f, so a row's own label never reaches the
+/// margins its gradients are computed from. Reuses builder leaf stamps when
+/// available; falls back to routing.
+#[allow(clippy::too_many_arguments)]
+fn fob_update_tracks_single(
+    tree: &DecisionTree,
+    binned: &BinnedData,
+    gradients: &[f64],
+    hessians: &[f64],
+    fold_of: &[u8],
+    fob_f: usize,
+    lambda: f64,
+    lr: f64,
+    row_leaves: &[u32],
+    fob_preds: &mut [f64],
+) {
+    let n_rows = fold_of.len();
+    let n_nodes = tree.values.len();
+    let have_stamps = row_leaves.len() == n_rows;
+    let mut leaf_of = vec![0u32; n_rows];
+    let mut lg = vec![0.0f64; n_nodes];
+    let mut lh = vec![0.0f64; n_nodes];
+    let mut lgf = vec![0.0f64; n_nodes * fob_f];
+    let mut lhf = vec![0.0f64; n_nodes * fob_f];
+    for i in 0..n_rows {
+        let leaf = if have_stamps && row_leaves[i] != u32::MAX {
+            row_leaves[i] as usize
+        } else {
+            tree.route_to_leaf(binned, i)
+        };
+        leaf_of[i] = leaf as u32;
+        let f = fold_of[i] as usize;
+        lg[leaf] += gradients[i];
+        lh[leaf] += hessians[i];
+        lgf[leaf * fob_f + f] += gradients[i];
+        lhf[leaf * fob_f + f] += hessians[i];
+    }
+    for i in 0..n_rows {
+        let leaf = leaf_of[i] as usize;
+        let f = fold_of[i] as usize;
+        let g = lg[leaf] - lgf[leaf * fob_f + f];
+        let h = lh[leaf] - lhf[leaf * fob_f + f];
+        let denom = h + lambda;
+        if h > 1e-10 && denom > 1e-10 {
+            fob_preds[f * n_rows + i] += lr * (-g / denom);
+        }
     }
 }

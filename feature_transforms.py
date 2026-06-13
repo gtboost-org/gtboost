@@ -226,6 +226,53 @@ def _pcf_apply_from_fit(
     return _pcf_apply_table(keys_apply, table, n_classes, alpha, global_prior)
 
 
+def _pcf_fit_table_regression(
+    keys: np.ndarray,
+    y: np.ndarray,
+    alpha: float,
+    global_mean: float,
+) -> dict[int, tuple[float, float]]:
+    uniq, inv = np.unique(keys.astype(np.int64, copy=False), return_inverse=True)
+    counts = np.zeros(len(uniq), dtype=np.float64)
+    sums = np.zeros(len(uniq), dtype=np.float64)
+    np.add.at(counts, inv, 1.0)
+    np.add.at(sums, inv, np.asarray(y, dtype=np.float64))
+    means = (sums + float(alpha) * float(global_mean)) / (counts + float(alpha))
+    return {int(k): (float(means[i]), float(counts[i])) for i, k in enumerate(uniq)}
+
+
+def _pcf_apply_table_regression(
+    keys: np.ndarray,
+    table: dict[int, tuple[float, float]],
+    alpha: float,
+    global_mean: float,
+) -> np.ndarray:
+    out = np.empty((len(keys), 4), dtype=np.float64)
+    for i, key in enumerate(keys.astype(np.int64, copy=False)):
+        row = table.get(int(key))
+        if row is None:
+            mean = float(global_mean)
+            n = 0.0
+        else:
+            mean, n = row
+        out[i, 0] = mean
+        out[i, 1] = mean - float(global_mean)
+        out[i, 2] = np.log1p(n)
+        out[i, 3] = n / (n + float(alpha))
+    return out
+
+
+def _pcf_apply_from_fit_regression(
+    keys_fit: np.ndarray,
+    y_fit: np.ndarray,
+    keys_apply: np.ndarray,
+    alpha: float,
+    global_mean: float,
+) -> np.ndarray:
+    table = _pcf_fit_table_regression(keys_fit, y_fit, alpha, global_mean)
+    return _pcf_apply_table_regression(keys_apply, table, alpha, global_mean)
+
+
 def _pcf_oof_block(
     keys_fit: np.ndarray,
     y_fit: np.ndarray,
@@ -285,6 +332,37 @@ def _pcf_oof_block(
             )
     applied = [
         _pcf_apply_from_fit(keys_fit, y_int, keys, n_classes, alpha, global_prior)
+        for keys in apply_keys
+    ]
+    return oof, applied
+
+
+def _pcf_oof_block_regression(
+    keys_fit: np.ndarray,
+    y_fit: np.ndarray,
+    apply_keys: list[np.ndarray],
+    alpha: float,
+    n_folds: int,
+    seed: int,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    from sklearn.model_selection import KFold
+
+    y_float = np.asarray(y_fit, dtype=np.float64)
+    global_mean = float(np.mean(y_float)) if y_float.size else 0.0
+    if len(y_float) < 4:
+        oof = _pcf_apply_from_fit_regression(
+            keys_fit, y_float, keys_fit, alpha, global_mean
+        )
+    else:
+        folds = min(max(2, int(n_folds)), len(y_float))
+        kf = KFold(n_splits=folds, shuffle=True, random_state=int(seed))
+        oof = np.zeros((len(y_float), 4), dtype=np.float64)
+        for tr, va in kf.split(keys_fit.reshape(-1, 1)):
+            oof[va] = _pcf_apply_from_fit_regression(
+                keys_fit[tr], y_float[tr], keys_fit[va], alpha, global_mean
+            )
+    applied = [
+        _pcf_apply_from_fit_regression(keys_fit, y_float, keys, alpha, global_mean)
         for keys in apply_keys
     ]
     return oof, applied
@@ -351,7 +429,15 @@ def _pcf_pact_nb_aggregate(
     if not blocks:
         return np.zeros((0, 0), dtype=np.float64)
     n_rows = int(blocks[0].shape[0])
-    prior = float(np.clip(np.asarray(global_prior, dtype=np.float64)[1], 1e-6, 1.0 - 1e-6))
+    prior_arr = np.asarray(global_prior, dtype=np.float64)
+    if prior_arr.size > 2:
+        return _pcf_pact_multiclass_aggregate(
+            blocks,
+            arities,
+            global_prior=prior_arr,
+            cfg=cfg,
+        )
+    prior = float(np.clip(prior_arr[1], 1e-6, 1.0 - 1e-6))
     prior_logit = float(_pcf_binary_logit(prior))
     clip_by_arity = {
         1: float(cfg.get("pact_clip_single", 3.0)),
@@ -422,11 +508,100 @@ def _pcf_pact_nb_aggregate(
     return np.column_stack(out_parts).astype(np.float64)
 
 
+def _pcf_pact_multiclass_aggregate(
+    blocks: Sequence[np.ndarray],
+    arities: Sequence[int],
+    *,
+    global_prior: np.ndarray,
+    cfg: dict,
+) -> np.ndarray:
+    """Fixed-width multiclass posterior evidence.
+
+    Each raw PCF block is a smoothed posterior for one categorical tuple. This
+    compressor converts tuple posteriors into centered log-prior lifts and
+    aggregates them by arity, so the downstream tree sees a small set of dense
+    evidence coordinates instead of dozens of K+3 posterior blocks.
+    """
+    if not blocks:
+        return np.zeros((0, 0), dtype=np.float64)
+    n_rows = int(blocks[0].shape[0])
+    prior = np.clip(np.asarray(global_prior, dtype=np.float64), 1e-6, 1.0)
+    prior = prior / np.sum(prior)
+    n_classes = int(prior.shape[0])
+    clip = float(cfg.get("pact_clip_multiclass", 2.5))
+    clip = max(clip, 1e-6)
+
+    total = np.zeros((n_rows, n_classes), dtype=np.float64)
+    rel_total = np.zeros(n_rows, dtype=np.float64)
+    entropy_total = np.zeros(n_rows, dtype=np.float64)
+    by_arity: dict[int, dict[str, np.ndarray | float]] = {}
+    for arity in (1, 2, 3):
+        by_arity[arity] = {
+            "sum": np.zeros((n_rows, n_classes), dtype=np.float64),
+            "rel": np.zeros(n_rows, dtype=np.float64),
+            "entropy": np.zeros(n_rows, dtype=np.float64),
+            "count": 0.0,
+        }
+
+    for block, arity_raw in zip(blocks, arities):
+        b = np.asarray(block, dtype=np.float64)
+        if b.ndim != 2 or b.shape[1] < n_classes + 2:
+            continue
+        arity = min(3, max(1, int(arity_raw)))
+        p = np.clip(b[:, :n_classes], 1e-6, 1.0)
+        p = p / np.maximum(np.sum(p, axis=1, keepdims=True), 1e-12)
+        rel = np.clip(b[:, n_classes + 1], 0.0, 1.0)
+        if b.shape[1] > n_classes + 2:
+            entropy_gain = np.asarray(b[:, n_classes + 2], dtype=np.float64)
+        else:
+            entropy_gain = np.zeros(n_rows, dtype=np.float64)
+        lift = np.log(p) - np.log(prior.reshape(1, -1))
+        lift -= np.mean(lift, axis=1, keepdims=True)
+        weighted = rel[:, None] * np.clip(lift, -clip, clip)
+
+        total += weighted
+        rel_total += rel
+        entropy_total += entropy_gain
+        state = by_arity[arity]
+        state["sum"] = np.asarray(state["sum"], dtype=np.float64) + weighted
+        state["rel"] = np.asarray(state["rel"], dtype=np.float64) + rel
+        state["entropy"] = np.asarray(state["entropy"], dtype=np.float64) + entropy_gain
+        state["count"] = float(state["count"]) + 1.0
+
+    def centered_logits(x: np.ndarray, rel: np.ndarray) -> np.ndarray:
+        z = x / np.sqrt(np.maximum(rel, 1.0))[:, None]
+        z -= np.mean(z, axis=1, keepdims=True)
+        return np.clip(z, -8.0, 8.0)
+
+    parts: list[np.ndarray] = [centered_logits(total, rel_total)]
+    for arity in (1, 2, 3):
+        state = by_arity[arity]
+        parts.append(centered_logits(np.asarray(state["sum"], dtype=np.float64), np.asarray(state["rel"], dtype=np.float64)))
+    parts.append(np.log1p(rel_total).reshape(-1, 1))
+    parts.append((entropy_total / np.maximum(rel_total, 1.0)).reshape(-1, 1))
+    for arity in (1, 2, 3):
+        state = by_arity[arity]
+        rel = np.asarray(state["rel"], dtype=np.float64)
+        count = max(float(state["count"]), 1.0)
+        parts.append((rel / count).reshape(-1, 1))
+    return np.column_stack(parts).astype(np.float64)
+
+
 def _binary_logloss_from_prob(y: np.ndarray, p: np.ndarray) -> float:
     y = np.asarray(y, dtype=np.float64)
     p = np.asarray(p, dtype=np.float64)
     p = np.clip(p, 1e-15, 1.0 - 1e-15)
     return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log1p(-p)))
+
+
+def _multiclass_logloss_from_prob(y: np.ndarray, p: np.ndarray) -> float:
+    y_int = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] != y_int.shape[0] or p.shape[1] < 2:
+        return float("inf")
+    rows = np.arange(y_int.shape[0])
+    q = np.clip(p[rows, y_int], 1e-15, 1.0)
+    return float(-np.mean(np.log(q)))
 
 
 def _pcf_oof_logloss_utility(
@@ -441,7 +616,8 @@ def _pcf_oof_logloss_utility(
     global_prior: np.ndarray,
     keys_fit: Optional[np.ndarray] = None,
 ) -> float:
-    if int(n_classes) != 2:
+    n_classes = int(n_classes)
+    if n_classes < 2:
         return 0.0
     if keys_fit is None:
         keys_fit = _pcf_key_matrix(X_fit, cols, hash_bins)
@@ -454,9 +630,47 @@ def _pcf_oof_logloss_utility(
         int(folds),
         int(seed),
     )
-    global_loss = _binary_logloss_from_prob(y_fit, np.full(len(y_fit), global_prior[1]))
-    block_loss = _binary_logloss_from_prob(y_fit, fit_block[:, 1])
+    if n_classes == 2:
+        global_loss = _binary_logloss_from_prob(y_fit, np.full(len(y_fit), global_prior[1]))
+        block_loss = _binary_logloss_from_prob(y_fit, fit_block[:, 1])
+    else:
+        global_prob = np.repeat(
+            np.asarray(global_prior, dtype=np.float64).reshape(1, -1),
+            len(y_fit),
+            axis=0,
+        )
+        global_loss = _multiclass_logloss_from_prob(y_fit, global_prob)
+        block_loss = _multiclass_logloss_from_prob(y_fit, fit_block[:, :n_classes])
     return float(global_loss - block_loss)
+
+
+def _pcf_oof_regression_utility(
+    X_fit: np.ndarray,
+    y_fit: np.ndarray,
+    cols: Sequence[int],
+    alpha: float,
+    folds: int,
+    seed: int,
+    hash_bins: int,
+    keys_fit: Optional[np.ndarray] = None,
+) -> float:
+    y_float = np.asarray(y_fit, dtype=np.float64)
+    if y_float.size == 0:
+        return 0.0
+    if keys_fit is None:
+        keys_fit = _pcf_key_matrix(X_fit, cols, hash_bins)
+    fit_block, _applied = _pcf_oof_block_regression(
+        keys_fit,
+        y_float,
+        [],
+        float(alpha),
+        int(folds),
+        int(seed),
+    )
+    global_mean = float(np.mean(y_float))
+    base_mse = float(np.mean((y_float - global_mean) ** 2))
+    block_mse = float(np.mean((y_float - fit_block[:, 0]) ** 2))
+    return float(base_mse - block_mse)
 
 
 def _pcf_select_tuple_candidates(
@@ -472,6 +686,7 @@ def _pcf_select_tuple_candidates(
     hash_bins: int,
     global_prior: np.ndarray,
     selection: str,
+    task_type: str = "classification",
     key_cache: Optional[dict[tuple[int, ...], np.ndarray]] = None,
 ) -> tuple[list[tuple[int, ...]], list[float]]:
     max_keep = max(0, int(max_keep))
@@ -491,18 +706,30 @@ def _pcf_select_tuple_candidates(
             keys_fit = _pcf_key_matrix(X_fit, key, hash_bins)
             if key_cache is not None:
                 key_cache[key] = keys_fit
-        score = _pcf_oof_logloss_utility(
-            X_fit,
-            y_fit,
-            key,
-            n_classes,
-            alpha,
-            folds,
-            seed + 1009 * (i + 1),
-            hash_bins,
-            global_prior,
-            keys_fit=keys_fit,
-        )
+        if str(task_type).lower() == "regression" or int(n_classes) <= 0:
+            score = _pcf_oof_regression_utility(
+                X_fit,
+                y_fit,
+                key,
+                alpha,
+                folds,
+                seed + 1009 * (i + 1),
+                hash_bins,
+                keys_fit=keys_fit,
+            )
+        else:
+            score = _pcf_oof_logloss_utility(
+                X_fit,
+                y_fit,
+                key,
+                n_classes,
+                alpha,
+                folds,
+                seed + 1009 * (i + 1),
+                hash_bins,
+                global_prior,
+                keys_fit=keys_fit,
+            )
         scored.append((score, key))
     scored.sort(key=lambda item: item[0], reverse=True)
     kept_scored = scored[:max_keep]
@@ -531,6 +758,122 @@ def _pcf_build_blocks(
     aggregate_mode = str(cfg.get("aggregate_mode", "none")).lower()
 
     cat_cols = _pcf_selected_cat_columns(X_fit, cat_mask, max_cat)
+    if int(n_classes) <= 0:
+        if aggregate_mode not in {"none", "", "off", "false", "0"}:
+            raise ValueError("regression PCF supports aggregate_mode='none'")
+        y_float = np.asarray(y_fit, dtype=np.float64)
+        global_mean = float(np.mean(y_float)) if y_float.size else 0.0
+        global_std = float(np.std(y_float)) if y_float.size else 0.0
+        global_prior = np.array([global_mean, global_std], dtype=np.float64)
+        fit_blocks: list[np.ndarray] = []
+        apply_blocks: list[list[np.ndarray]] = [[] for _ in apply_mats]
+        block_arities: list[int] = []
+        output_block_widths: list[int] = []
+        output_block_arities: list[int] = []
+        key_cache: dict[tuple[int, ...], np.ndarray] = {}
+
+        def fit_keys_for(cols: Sequence[int]) -> np.ndarray:
+            key = tuple(int(c) for c in cols)
+            cached = key_cache.get(key)
+            if cached is not None:
+                return cached
+            keys = _pcf_key_matrix(X_fit, key, hash_bins)
+            key_cache[key] = keys
+            return keys
+
+        def add_block(cols: Sequence[int], block_alpha: float, block_seed: int) -> None:
+            keys_fit = fit_keys_for(cols)
+            keys_apply = [_pcf_key_matrix(Xa, cols, hash_bins) for Xa in apply_mats]
+            fit_block, applied = _pcf_oof_block_regression(
+                keys_fit, y_float, keys_apply, block_alpha, folds, block_seed
+            )
+            fit_blocks.append(fit_block)
+            output_block_widths.append(int(fit_block.shape[1]))
+            arity = len(tuple(cols))
+            block_arities.append(arity)
+            output_block_arities.append(arity)
+            for out, block in zip(apply_blocks, applied):
+                out.append(block)
+
+        for col in cat_cols:
+            add_block([col], alpha, seed)
+
+        pair_candidates_all = [
+            tuple(int(c) for c in cols) for cols in itertools.combinations(cat_cols, 2)
+        ]
+        pair_candidates, pair_scores = _pcf_select_tuple_candidates(
+            X_fit,
+            y_float,
+            pair_candidates_all,
+            max_pairs,
+            n_classes=0,
+            alpha=pair_alpha,
+            folds=folds,
+            seed=seed + 17,
+            hash_bins=hash_bins,
+            global_prior=global_prior,
+            selection=tuple_selection,
+            task_type="regression",
+            key_cache=key_cache,
+        )
+        pair_keep = [
+            (cols, score)
+            for cols, score in zip(pair_candidates, pair_scores)
+            if float(score) > 0.0
+        ]
+        pair_candidates = [cols for cols, _score in pair_keep]
+        pair_scores = [float(score) for _cols, score in pair_keep]
+        for cols in pair_candidates:
+            add_block(cols, pair_alpha, seed + 17)
+
+        triple_candidates_all = [
+            tuple(int(c) for c in cols) for cols in itertools.combinations(cat_cols, 3)
+        ]
+        triple_candidates, triple_scores = _pcf_select_tuple_candidates(
+            X_fit,
+            y_float,
+            triple_candidates_all,
+            max_triples,
+            n_classes=0,
+            alpha=triple_alpha,
+            folds=folds,
+            seed=seed + 29,
+            hash_bins=hash_bins,
+            global_prior=global_prior,
+            selection=tuple_selection,
+            task_type="regression",
+            key_cache=key_cache,
+        )
+        triple_keep = [
+            (cols, score)
+            for cols, score in zip(triple_candidates, triple_scores)
+            if float(score) > 0.0
+        ]
+        triple_candidates = [cols for cols, _score in triple_keep]
+        triple_scores = [float(score) for _cols, score in triple_keep]
+        for cols in triple_candidates:
+            add_block(cols, triple_alpha, seed + 29)
+
+        meta = {
+            "selected_cat_idx": [int(c) for c in cat_cols],
+            "n_single_blocks": int(len(cat_cols)),
+            "n_pair_blocks": int(len(pair_candidates)),
+            "n_triple_blocks": int(len(triple_candidates)),
+            "n_blocks": int(len(fit_blocks)),
+            "n_pcf_features": int(sum(block.shape[1] for block in fit_blocks)),
+            "pcf_block_widths": [int(w) for w in output_block_widths],
+            "pcf_block_arities": [int(a) for a in output_block_arities],
+            "coordinate_mode": "regression_mean4",
+            "aggregate_mode": aggregate_mode,
+            "tuple_selection": tuple_selection,
+            "pair_scores_top": [float(x) for x in pair_scores[:5]],
+            "triple_scores_top": [float(x) for x in triple_scores[:5]],
+            "key_cache_blocks": int(len(key_cache)),
+            "global_mean": global_mean,
+            "global_std": global_std,
+        }
+        return fit_blocks, apply_blocks, meta
+
     class_counts = np.bincount(y_fit.astype(np.int64), minlength=n_classes).astype(np.float64)
     global_prior = (class_counts + 1.0) / (class_counts.sum() + n_classes)
     fit_blocks: list[np.ndarray] = []
@@ -726,10 +1069,13 @@ def _pcf_assemble_view(
     cfg: dict,
     seed: int,
 ) -> tuple[np.ndarray, list[np.ndarray], list[bool], dict]:
-    if task_type != "binary" or int(n_classes) != 2:
-        raise ValueError("PCF geometry is currently binary-only")
+    if task_type not in {"binary", "multiclass", "regression"}:
+        raise ValueError("PCF geometry requires a supervised task")
+    if task_type in {"binary", "multiclass"} and int(n_classes) < 2:
+        raise ValueError("classification PCF geometry requires at least two classes")
+    build_n_classes = 0 if task_type == "regression" else int(n_classes)
     fit_blocks, apply_blocks, meta = _pcf_build_blocks(
-        X_fit, y_fit, apply_mats, cat_mask, n_classes, cfg, seed
+        X_fit, y_fit, apply_mats, cat_mask, build_n_classes, cfg, seed
     )
     if not fit_blocks:
         raise ValueError("PCF geometry produced no posterior blocks")
@@ -776,7 +1122,11 @@ def _pcf_assemble_view(
         view=view,
         mode=group_mode,
     )
-    return out_fit, out_apply, [False] * int(out_fit.shape[1]), meta
+    if view == "pcf_append":
+        out_cat_mask = list(cat_mask) + [False] * int(pcf_fit.shape[1])
+    else:
+        out_cat_mask = [False] * int(out_fit.shape[1])
+    return out_fit, out_apply, out_cat_mask, meta
 
 
 class PCFGeometryRuntime:
@@ -817,7 +1167,47 @@ class PCFGeometryRuntime:
 
     def _cfg(self) -> dict:
         cfg = dict(self.config)
-        cfg.setdefault("view", "pcf_replace_cats")
+        profile = str(cfg.get("profile", "") or "").lower()
+        if profile in {"mc_fast", "fast_mc", "multiclass_fast", "lite"} and self.task_type == "multiclass":
+            cfg.setdefault("view", "pcf_append")
+            cfg.setdefault("max_cat", 9)
+            cfg.setdefault("max_pairs", 6)
+            cfg.setdefault("max_triples", 0)
+            cfg.setdefault("hash_bins", 8192)
+            cfg.setdefault("alpha", 24.0)
+            cfg.setdefault("pair_alpha", 64.0)
+            cfg.setdefault("triple_alpha", 128.0)
+            cfg.setdefault("folds", int(cfg.get("internal_folds", 3)))
+            cfg.setdefault("coordinate_mode", "current")
+            cfg.setdefault("aggregate_mode", "pact_nb")
+            cfg.setdefault("tuple_selection", "oof_logloss")
+            cfg.setdefault("eligibility_gate", True)
+            cfg.setdefault("min_cat_features", 2)
+            cfg.setdefault("min_max_cardinality", 2)
+            cfg.setdefault("min_repeated_levels", 4)
+            cfg.setdefault("min_entropy_eff", 1.5)
+        elif profile in {"mc_blocks", "multiclass_blocks", "fast_mc_blocks"} and self.task_type == "multiclass":
+            cfg.setdefault("view", "pcf_append")
+            cfg.setdefault("max_cat", 9)
+            cfg.setdefault("max_pairs", 6)
+            cfg.setdefault("max_triples", 0)
+            cfg.setdefault("hash_bins", 8192)
+            cfg.setdefault("alpha", 24.0)
+            cfg.setdefault("pair_alpha", 64.0)
+            cfg.setdefault("triple_alpha", 128.0)
+            cfg.setdefault("folds", int(cfg.get("internal_folds", 3)))
+            cfg.setdefault("coordinate_mode", "current")
+            cfg.setdefault("aggregate_mode", "none")
+            cfg.setdefault("tuple_selection", "oof_logloss")
+            cfg.setdefault("eligibility_gate", True)
+            cfg.setdefault("min_cat_features", 2)
+            cfg.setdefault("min_max_cardinality", 2)
+            cfg.setdefault("min_repeated_levels", 4)
+            cfg.setdefault("min_entropy_eff", 1.5)
+        cfg.setdefault(
+            "view",
+            "pcf_append" if self.task_type == "regression" else "pcf_replace_cats",
+        )
         cfg.setdefault("max_cat", 9)
         cfg.setdefault("max_pairs", 36)
         cfg.setdefault("max_triples", 84)
@@ -868,14 +1258,22 @@ class PCFGeometryRuntime:
         apply_mats: Optional[Sequence[np.ndarray]] = None,
     ) -> tuple[np.ndarray, list[np.ndarray], list[bool], dict]:
         X_fit = np.asarray(X_fit, dtype=np.float64)
-        y_int = np.asarray(y_fit, dtype=np.int64)
+        is_regression = str(self.task_type).lower() == "regression"
+        y_arr = np.asarray(y_fit, dtype=np.float64)
+        y_int = None if is_regression else np.asarray(y_fit, dtype=np.int64)
         apply_list = [np.asarray(x, dtype=np.float64) for x in (apply_mats or [])]
         cat_mask = list(cat_mask)
 
-        if self.task_type != "binary" or self.n_classes != 2:
+        if self.task_type not in {"binary", "multiclass", "regression"} or (
+            not is_regression and self.n_classes < 2
+        ):
             if self.fallback_raw:
-                return self._raw_outputs(X_fit, cat_mask, "PCF runtime is currently binary-only")
-            raise ValueError("PCF runtime is currently binary-only")
+                return self._raw_outputs(
+                    X_fit,
+                    cat_mask,
+                    "PCF runtime requires a supervised classification/regression task",
+                )
+            raise ValueError("PCF runtime requires a supervised classification/regression task")
         if len(cat_mask) != X_fit.shape[1]:
             raise ValueError(
                 f"cat_features length {len(cat_mask)} does not match X width {X_fit.shape[1]}"
@@ -904,23 +1302,52 @@ class PCFGeometryRuntime:
         cat_cols = _pcf_selected_cat_columns(X_fit, cat_mask, max_cat)
         tuple_defs: list[tuple[tuple[int, ...], float, int]] = []
         tuple_defs.extend(((int(c),), alpha, self.seed) for c in cat_cols)
+        if is_regression:
+            global_for_selection = np.array(
+                [
+                    float(np.mean(y_arr)) if y_arr.size else 0.0,
+                    float(np.std(y_arr)) if y_arr.size else 0.0,
+                ],
+                dtype=np.float64,
+            )
+            select_n_classes = 0
+            select_y = y_arr
+            select_task = "regression"
+        else:
+            class_counts_for_selection = np.bincount(
+                y_int, minlength=self.n_classes
+            ).astype(np.float64)
+            global_for_selection = (class_counts_for_selection + 1.0) / (
+                len(y_int) + self.n_classes
+            )
+            select_n_classes = self.n_classes
+            select_y = y_int
+            select_task = "classification"
         pair_candidates_all = [
             tuple(int(c) for c in cols) for cols in itertools.combinations(cat_cols, 2)
         ]
         pair_candidates, pair_scores = _pcf_select_tuple_candidates(
             X_fit,
-            y_int,
+            select_y,
             pair_candidates_all,
             max_pairs,
-            n_classes=self.n_classes,
+            n_classes=select_n_classes,
             alpha=pair_alpha,
             folds=folds,
             seed=self.seed + 17,
             hash_bins=self.hash_bins_,
-            global_prior=(np.bincount(y_int, minlength=self.n_classes).astype(np.float64) + 1.0)
-            / (len(y_int) + self.n_classes),
+            global_prior=global_for_selection,
             selection=tuple_selection,
+            task_type=select_task,
         )
+        if is_regression:
+            pair_keep = [
+                (cols, score)
+                for cols, score in zip(pair_candidates, pair_scores)
+                if float(score) > 0.0
+            ]
+            pair_candidates = [cols for cols, _score in pair_keep]
+            pair_scores = [float(score) for _cols, score in pair_keep]
         tuple_defs.extend(
             (tuple(int(c) for c in cols), pair_alpha, self.seed + 17)
             for cols in pair_candidates
@@ -930,18 +1357,26 @@ class PCFGeometryRuntime:
         ]
         triple_candidates, triple_scores = _pcf_select_tuple_candidates(
             X_fit,
-            y_int,
+            select_y,
             triple_candidates_all,
             max_triples,
-            n_classes=self.n_classes,
+            n_classes=select_n_classes,
             alpha=triple_alpha,
             folds=folds,
             seed=self.seed + 29,
             hash_bins=self.hash_bins_,
-            global_prior=(np.bincount(y_int, minlength=self.n_classes).astype(np.float64) + 1.0)
-            / (len(y_int) + self.n_classes),
+            global_prior=global_for_selection,
             selection=tuple_selection,
+            task_type=select_task,
         )
+        if is_regression:
+            triple_keep = [
+                (cols, score)
+                for cols, score in zip(triple_candidates, triple_scores)
+                if float(score) > 0.0
+            ]
+            triple_candidates = [cols for cols, _score in triple_keep]
+            triple_scores = [float(score) for _cols, score in triple_keep]
         tuple_defs.extend(
             (tuple(int(c) for c in cols), triple_alpha, self.seed + 29)
             for cols in triple_candidates
@@ -951,9 +1386,13 @@ class PCFGeometryRuntime:
                 return self._raw_outputs(X_fit, cat_mask, "PCF selected no categorical tuples")
             raise ValueError("PCF selected no categorical tuples")
 
-        class_counts = np.bincount(y_int, minlength=self.n_classes).astype(np.float64)
-        self.global_prior_ = (class_counts + 1.0) / (class_counts.sum() + self.n_classes)
-        self.y_fit_ = y_int.copy()
+        if is_regression:
+            self.global_prior_ = global_for_selection
+            self.y_fit_ = y_arr.copy()
+        else:
+            class_counts = np.bincount(y_int, minlength=self.n_classes).astype(np.float64)
+            self.global_prior_ = (class_counts + 1.0) / (class_counts.sum() + self.n_classes)
+            self.y_fit_ = y_int.copy()
         self.cat_mask_ = list(cat_mask)
         self.numeric_cols_ = [i for i, is_cat in enumerate(cat_mask) if not is_cat]
         self.blocks_ = []
@@ -966,16 +1405,26 @@ class PCFGeometryRuntime:
         for cols, block_alpha, block_seed in tuple_defs:
             keys_fit = _pcf_key_matrix(X_fit, cols, self.hash_bins_)
             keys_apply = [_pcf_key_matrix(Xa, cols, self.hash_bins_) for Xa in apply_list]
-            fit_block, applied = _pcf_oof_block(
-                keys_fit,
-                y_int,
-                keys_apply,
-                self.n_classes,
-                block_alpha,
-                folds,
-                int(block_seed),
-            )
-            if self.aggregate_mode_ != "pact_nb":
+            if is_regression:
+                fit_block, applied = _pcf_oof_block_regression(
+                    keys_fit,
+                    y_arr,
+                    keys_apply,
+                    block_alpha,
+                    folds,
+                    int(block_seed),
+                )
+            else:
+                fit_block, applied = _pcf_oof_block(
+                    keys_fit,
+                    y_int,
+                    keys_apply,
+                    self.n_classes,
+                    block_alpha,
+                    folds,
+                    int(block_seed),
+                )
+            if self.aggregate_mode_ != "pact_nb" and not is_regression:
                 fit_block = _pcf_project_block(
                     fit_block,
                     n_classes=self.n_classes,
@@ -991,6 +1440,8 @@ class PCFGeometryRuntime:
                     )
                     for block in applied
                 ]
+            elif self.aggregate_mode_ == "pact_nb" and is_regression:
+                raise ValueError("regression PCF supports aggregate_mode='none'")
             fit_blocks.append(fit_block)
             output_block_widths.append(int(fit_block.shape[1]))
             arity = len(tuple(cols))
@@ -1029,7 +1480,10 @@ class PCFGeometryRuntime:
             raise ValueError(f"unknown PCF aggregate_mode: {self.aggregate_mode_}")
         X_out = self._assemble(X_fit, pcf_fit)
         apply_out = [self._assemble(Xa, pa) for Xa, pa in zip(apply_list, pcf_apply)]
-        self.out_cat_mask_ = [False] * int(X_out.shape[1])
+        if self.view_ == "pcf_append":
+            self.out_cat_mask_ = list(cat_mask) + [False] * int(pcf_fit.shape[1])
+        else:
+            self.out_cat_mask_ = [False] * int(X_out.shape[1])
         self.enabled = True
         self.meta_ = {
             "enabled": True,
@@ -1079,16 +1533,27 @@ class PCFGeometryRuntime:
         arities = []
         for block in self.blocks_:
             keys_apply = _pcf_key_matrix(X, block["cols"], self.hash_bins_)
-            raw_block = _pcf_apply_from_fit(
-                block["keys_fit"],
-                self.y_fit_,
-                keys_apply,
-                self.n_classes,
-                float(block["alpha"]),
-                self.global_prior_,
-            )
+            if self.task_type == "regression":
+                raw_block = _pcf_apply_from_fit_regression(
+                    block["keys_fit"],
+                    self.y_fit_,
+                    keys_apply,
+                    float(block["alpha"]),
+                    float(self.global_prior_[0]),
+                )
+            else:
+                raw_block = _pcf_apply_from_fit(
+                    block["keys_fit"],
+                    self.y_fit_,
+                    keys_apply,
+                    self.n_classes,
+                    float(block["alpha"]),
+                    self.global_prior_,
+                )
             arities.append(len(tuple(block["cols"])))
             if self.aggregate_mode_ == "pact_nb":
+                blocks.append(raw_block)
+            elif self.task_type == "regression":
                 blocks.append(raw_block)
             else:
                 blocks.append(
@@ -1228,15 +1693,20 @@ def build_pcf_geometry_views(
         os.environ.get("GTBOOST_PCF_GROUP_COLSAMPLE_MODE", "tuple"),
     )
     seed = int(cfg.get("seed", 42))
-    if task_type != "binary" or int(n_classes) != 2:
+    if task_type not in {"binary", "multiclass", "regression"} or (
+        task_type in {"binary", "multiclass"} and int(n_classes) < 2
+    ):
         return {
             "enabled": False,
-            "gate_info": {"accepted": False, "reason": "PCF is currently binary-only"},
+            "gate_info": {
+                "accepted": False,
+                "reason": "PCF requires a supervised classification/regression task",
+            },
         }
     ok, support = _pcf_eligible(X_tr, cat_mask, cfg)
     if bool(cfg.get("eligibility_gate", True)) and not ok:
         return {"enabled": False, "gate_info": support}
-    if int(cfg.get("outer_gate", 1)) == 1:
+    if int(cfg.get("outer_gate", 1)) == 1 and task_type == "binary" and int(n_classes) == 2:
         if int(cfg.get("outer_gate_screen", 0)) == 1:
             screen_cfg = dict(cfg)
             screen_cfg["max_pairs"] = int(cfg.get("outer_gate_screen_pairs", 12))
@@ -1267,6 +1737,12 @@ def build_pcf_geometry_views(
         if not gate_info.get("accepted", False):
             gate_info["support"] = support
             return {"enabled": False, "gate_info": gate_info}
+    elif int(cfg.get("outer_gate", 1)) == 1:
+        gate_info = {
+            "accepted": True,
+            "reason": "outer_gate skipped for non-binary PCF",
+            "support": support,
+        }
     else:
         gate_info = {"accepted": True, "reason": "outer_gate disabled", "support": support}
 

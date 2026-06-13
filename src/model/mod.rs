@@ -15,6 +15,61 @@ mod training;
 type CachedEvalData = Option<(Vec<u16>, Vec<f64>, usize, Vec<f64>, Vec<u16>)>;
 const MODEL_FORMAT_VERSION: u32 = 1;
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(super) struct VerticalPrior {
+    mean: f64,
+    edges: Vec<Vec<f64>>,
+    effects: Vec<Vec<f64>>,
+}
+
+impl VerticalPrior {
+    #[inline]
+    fn is_active(&self) -> bool {
+        !self.effects.is_empty()
+    }
+
+    #[inline]
+    fn bin_index(edges: &[f64], value: f64) -> usize {
+        if !value.is_finite() {
+            return edges.len() + 1;
+        }
+        let mut lo = 0usize;
+        let mut hi = edges.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if value <= edges[mid] {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    fn predict_row(&self, row: &[f64]) -> f64 {
+        let mut out = self.mean;
+        for (j, (edges, effects)) in self.edges.iter().zip(self.effects.iter()).enumerate() {
+            if effects.len() <= 1 || j >= row.len() {
+                continue;
+            }
+            let bin = Self::bin_index(edges, row[j]);
+            if bin < effects.len() {
+                out += effects[bin];
+            }
+        }
+        out
+    }
+
+    fn predict_matrix(&self, x_data: &[f64], n_rows: usize, n_features: usize) -> Vec<f64> {
+        if !self.is_active() || x_data.len() < n_rows.saturating_mul(n_features) {
+            return vec![self.mean; n_rows];
+        }
+        (0..n_rows)
+            .map(|row| self.predict_row(&x_data[row * n_features..(row + 1) * n_features]))
+            .collect()
+    }
+}
+
 /// Reusable pre-binned training/eval matrix for HPO.
 ///
 /// This caches the expensive quantile/category bin construction once, then
@@ -184,6 +239,12 @@ pub struct GTBoostModel {
     pub(super) subsample_rate: f64,
     pub(super) base_score: f64,
     pub(super) class_base_scores: Vec<f64>, // multiclass prior margins (log class frequencies, centered)
+    #[serde(default)]
+    pub(super) vertical_init: bool,
+    #[serde(default)]
+    pub(super) vertical_init_cycles: usize,
+    #[serde(default)]
+    pub(super) vertical_prior: VerticalPrior,
     pub(super) lambda_reg: f64,
     pub(super) gamma: f64,
     pub(super) min_child_weight: f64,
@@ -191,18 +252,28 @@ pub struct GTBoostModel {
     pub(super) task: String,
     pub(super) num_bins: usize,
     pub(super) seed: u64,
-    pub(super) grow_policy: String, // "depthwise", "leafwise", or "oblivious"
+    pub(super) grow_policy: String, // "depthwise", "leafwise", "oblivious", or "adaptive"
     pub(super) max_leaves: usize,   // max leaves for leafwise (0 = use 2^max_depth)
     pub(super) n_refine: usize,     // refinement passes (0 = disabled)
     pub(super) n_leaf_splits: usize, // post-refinement leaf splitting passes (0 = disabled)
     pub(super) refine_every: usize, // refine all trees every N rounds during training (0 = only at end)
     pub(super) early_stopping_rounds: usize, // 0 = disabled
+    pub(super) eval_metric: String, // Validation metric for early stopping ("auto"/"logloss"/"auc").
     #[serde(default)]
     pub(super) verbose: usize, // progress logging interval in rounds (0 = silent)
     pub(super) l1_reg: f64, // L1 regularization on leaf values during refinement (0 = disabled)
     pub(super) refine_alpha: f64, // refinement shrinkage: blend w_old + alpha*(w_new - w_old), 1.0 = full step
     pub(super) honest: bool, // honest estimation: build structure on half data, leaf values on other half
     pub(super) honest_fraction: f64, // fraction of subsampled data for estimation (0.0 = use complement of subsample)
+    pub(super) honest_arbitration: bool, // NEW 2026-06-11: splits must also show positive Newton gain on the estimation fold (kills winner's-curse splits per node)
+    pub(super) feature_gain_prior: Vec<f64>, // NEW 2026-06-11: consensus-guided boosting — per-feature gain multiplier distilled from fold-model replication (empty = off)
+    pub(super) thermal: f64, // NEW 2026-06-11: thermal boosting — node-adaptive split sampling at the argmax-bias scale T_node ~ sqrt(2 ln K)/sqrt(n_node); 0 = argmax
+    pub(super) thermal_n_exp: f64, // thermal schedule shape: evidence exponent (T ~ 1/n^exp)
+    pub(super) thermal_depth_gamma: f64, // thermal schedule shape: per-depth multiplier
+    pub(super) stein_leaves: bool, // SP-GBDT — calibration-preserving positive-part Stein shrinkage of each tree's leaf vector at estimated gradient-noise scale (owner proposal). 2026-06-12 v2: leaf CONTRASTS shrink toward the global Newton step (not toward zero) — the constant score-shift direction is preserved per SP-GBDT §2.5. This repaired the old clean-data harm (friedman-clean +2.3% -> -0.4%); 10-seed profile: diabetes -1.1%, friedman-noisy -0.8%, clean neutral — never-hurts, no gate needed.
+    pub(super) stein_levels: bool, // NEW 2026-06-12: tree-structured Stein — per-depth-level pooled shrinkage of path contrasts (smooth adaptive depth; pairs with deep trees)
+    #[serde(default)]
+    pub(super) split_audit_fraction: f64, // Audit-only split debiasing: validate split choice on this held-out fraction, then refit leaves on all rows.
     pub(super) colsample_bylevel: f64, // column subsampling ratio per tree depth level (1.0 = disabled)
     pub(super) lr_decay: f64, // learning rate decay: effective lr linearly decays to lr*lr_decay by end (1.0 = no decay)
     pub(super) n_trees_per_round: usize, // build N trees per round with averaged contributions (1 = standard)
@@ -224,11 +295,69 @@ pub struct GTBoostModel {
     pub(super) grad_momentum: f64, // Gradient momentum: blend grad_t = (1-mom)*fresh + mom*prev_grad (0.0 = disabled)
     pub(super) gain_penalty: f64, // Bayesian gain penalty: penalize splits with uncertain children (0.0 = disabled)
     pub(super) split_pessimism: f64, // Evidence-corrected split gain: discounts low-support, high-search-width split wins.
+    #[serde(default)]
+    pub(super) cat_prototype_bins: usize, // Residual-prototype categorical split compression. 0 = ordinary full scan.
+    #[serde(default)]
+    pub(super) cat_audit_strength: f64, // Categorical-only support/search audit penalty. 0.0 = disabled.
+    #[serde(default)]
+    pub(super) split_contrast_penalty: f64, // Shrink weak left/right leaf contrasts after split gain scoring.
+    #[serde(default)]
+    pub(super) signal_gate: f64, // Free trees: admit a split only if gain > gate × within-node permutation null gain. 0.0 = off.
+    #[serde(default)]
+    pub(super) supervised_bins: bool, // DP bins: build a 4x fine quantile grid, DP-merge to num_bins where the initial gradient profile changes. false = plain quantile.
+    #[serde(default)]
+    pub(super) fold_ordered: usize, // Fold-Ordered Boosting: F honest margin tracks; each row's gradients come from a model whose leaf values exclude that row's fold (CatBoost-style ordered boosting at fold granularity). 0 = off.
+    // ── CFE: Categorical Fold Evidence (native fast replacement for PCF) ──
+    // Cross-fit tuple posteriors over categorical columns: leak-safe like
+    // CatBoost's ordered TS but fold-deterministic (no permutation noise, no
+    // cold-start rows), with utility-screened pair/triple crosses and PACT-
+    // style naive-Bayes aggregate columns appended as derived features.
+    #[serde(default)]
+    pub(super) cat_fold_evidence: bool,
+    #[serde(default)]
+    pub(super) cfe_folds: usize, // cross-fit folds (default 5)
+    #[serde(default)]
+    pub(super) cfe_max_pairs: usize, // pair crosses kept (default 12)
+    #[serde(default)]
+    pub(super) cfe_max_triples: usize, // triple crosses kept (default 8)
+    #[serde(default)]
+    pub(super) cfe_max_quads: usize, // arity-4 crosses kept (default 6) — exhaustive static deep crosses, the region CatBoost's greedy in-tree combos miss
+    #[serde(default)]
+    pub(super) cfe_dual_prior: bool, // emit each tuple's lift at TWO shrinkage strengths (m, 16m) so trees pick the confidence level per region
+    #[serde(default)]
+    pub(super) cfe_smooth: f64, // EB prior strength m (default 20.0)
+    #[serde(default = "serde_true")]
+    pub(super) cfe_counter: bool, // emit log-count (Counter-CTR) companion columns
+    #[serde(default = "serde_true")]
+    pub(super) cfe_aggmax: bool, // emit per-arity max-evidence aggregate columns
+    #[serde(default)]
+    pub(super) cfe_demote_raw: bool, // flatten raw HIGH-CARD cat columns when CFE is active (their native splits are the overfit liability the evidence replaces)
+    #[serde(default)]
+    pub(super) cfe_demote_min_card: usize, // cardinality above which raw cats are demoted (default 64)
+    #[serde(default)]
+    pub(super) cfe_tuples: Vec<Vec<usize>>, // trained tuple feature sets
+    #[serde(default)]
+    pub(super) cfe_tables: Vec<HashMap<i64, (f64, Vec<f64>)>>, // key -> (count, per-output sums), full train
+    #[serde(default)]
+    pub(super) cfe_prior: Vec<f64>, // per-output global prior
+    #[serde(default)]
+    pub(super) cfe_residual_rounds: usize, // stage-2 residual evidence: internal warmup rounds (0 = off)
+    #[serde(default)]
+    pub(super) cfe_resid_tables: Vec<HashMap<i64, (f64, Vec<f64>)>>, // key -> (count, residual-gradient sums)
+    #[serde(default)]
+    pub(super) cfe_resid_prior: f64, // global residual prior (mean target)
+    #[serde(default)]
+    pub(super) cfe_n_out: usize, // 1 (binary/regression) or K (multiclass)
     pub(super) self_score_splits: bool, // Allow trees to split on the current boosting margin.
     pub(super) hetero_trees: bool, // Heterogeneous sub-trees: cycle (depth, lambda) across sub-trees for structural diversity
     pub(super) dart_rate: f64, // DART: fraction of trees to drop per round during training (0.0 = disabled)
     pub(super) max_delta_step: f64, // Max leaf value magnitude (0.0 = unlimited, >0 clips leaf values)
+    #[serde(default)]
+    pub(super) main_effect_interval: usize, // Insert one residual-chosen single-feature tree every N boosting rounds (0 = disabled).
+    #[serde(default)]
+    pub(super) main_effect_depth: usize, // Depth for inserted main-effect trees; 1 = stump, >1 = piecewise univariate.
     pub(super) cyclic_features: bool, // EBM-style: cycle through features, each tree uses one feature (false = disabled)
+    pub(super) cyclic_max_features_per_round: usize, // Sparse vertical attention: max cyclic feature trees per boosting round (0 = all)
     pub(super) auto_interactions: bool, // Auto-generate pairwise numeric product features in binning (false = disabled)
     pub(super) auto_cat_interactions: bool, // Auto-generate hashed categorical pair features in binning (false = disabled)
     pub(super) max_interaction_features: usize, // Max product feature pairs to generate (0 = unlimited)
@@ -237,6 +366,8 @@ pub struct GTBoostModel {
     pub(super) extra_trees: bool, // Extra Trees: random split thresholds instead of optimal (massive variance reduction)
     pub(super) label_smooth: f64, // Label smoothing for multiclass: target = (1-ε)*one_hot + ε/K (0.0 = off)
     pub(super) multi_output_tree: bool, // Multi-output trees for multiclass: shared tree structure across all K classes
+    #[serde(default)]
+    pub(super) multiclass_pair_sequence: bool, // Confusion-pair boosting: one contrast tree per multiclass round.
     pub(super) prob_avg: bool, // Probability averaging: softmax each sub-tree independently then average (RF-like prediction)
     pub(super) honest_tau: f64, // Bayesian leaf blending: tau > 0 blends complement estimate with structure prior
     pub(super) complement_debias_mode: u8, // CDSS: 0=off, 1=geomean(struct, honest), 2=min, 3=mean
@@ -253,7 +384,7 @@ pub struct GTBoostModel {
     pub(super) adaptive_feature_mask_penalty: f64, // Diversity penalty for reusing a feature in pressure masks within the same round.
     pub(super) adaptive_root_anchor: bool, // Pressure anchors: force depthwise root split to the current strongest residual feature.
     pub(super) adaptive_root_anchor_penalty: f64, // Diversity penalty for reusing a root anchor within the same round.
-    pub(super) sparse_oblique_splits: bool, // Sparse 2-feature oblique split candidates for depthwise trees.
+    pub(super) sparse_oblique_splits: bool, // Sparse 2-feature oblique split candidates for depthwise/leafwise trees.
     pub(super) interval_splits: bool, // Bounded numeric interval split candidates: low <= x_j <= high.
     pub(super) sibling_block_correction: f64, // Joint per-round least-squares rescale for sibling trees (0.0 = disabled).
     pub(super) adam_beta2: f64, // Adam 2nd-moment decay (0.0 = disabled). Uses grad_momentum as β1.
@@ -262,8 +393,19 @@ pub struct GTBoostModel {
     pub(super) split_criterion: String, // "newton" (default), "rank" (Wilcoxon-like), or "sign" (distribution-free)
     pub(super) rank_mix_alpha: f64, // MGB: for task="binary", blend α·g_rank + (1-α)·g_logloss. 0 = pure binary.
     pub(super) rank_mix_start_frac: f64, // Late-MGB: delay rank-mix until this training fraction. 0 = active from start.
+    pub(super) rank_pair_temperature: f64, // Pairwise rank-loss score scale. Larger values keep AUC gradients from saturating.
     pub(super) binary_focus_gamma: f64, // Hard-row focus for binary loss: multiply g/h by (2*|y-p|)^gamma. 0 = off.
     pub(super) binary_focus_end_frac: f64, // Focus warmup: if >0, turn binary_focus_gamma off after this training fraction.
+    #[serde(default)]
+    pub(super) residual_focus_alpha: f64, // Generic residual-hardness focus: multiply g/h by 1+alpha*|g|/(median|g|+|g|). 0 = off.
+    #[serde(default)]
+    pub(super) residual_focus_max_scale: f64, // Max scale for residual focus. Default/low values are clamped to >=1.
+    #[serde(default)]
+    pub(super) residual_focus_mode: String, // "full" = split+leaf, "split_only" = focused structure with raw Newton leaves.
+    #[serde(default)]
+    pub(super) residual_focus_hessian_mode: String, // "equal" = h*=scale, "none" = raw h, "true" = detached shaped-loss curvature.
+    #[serde(default)]
+    pub(super) residual_focus_redescend_tau: f64, // >0 focuses moderate residuals and returns extreme residuals toward baseline.
     pub(super) feature_view_groups: Vec<u32>, // Optional feature-group id per column. When set, subtrees cycle across groups instead of sampling from the full feature set.
     pub(super) leaf_trim_pct: f64, // Trimmed-mean leaf values (Huber-style robust). 0.0 = pure Newton; 0.1 = trim 10% from each tail.
     pub(super) leaf_median: bool, // §124 LAD-style: use weighted median of (-g/h) per leaf instead of Newton mean. Classical Friedman 1999 LAD-TreeBoost.
@@ -304,6 +446,8 @@ pub struct GTBoostModel {
     pub(super) ordered_ctr_min_count: usize, // Minimum non-missing category count to consider a feature.
     pub(super) ordered_ctr_features: Vec<usize>, // Trained source feature indices.
     pub(super) ordered_ctr_prior: f64,       // Trained global target prior.
+    #[serde(default)]
+    pub(super) ordered_ctr_priors: Vec<f64>, // Per-CTR-column fallback priors.
     pub(super) ordered_ctr_maps: Vec<HashMap<i64, f64>>, // Per-feature full-data category -> smoothed mean.
     pub(super) ordered_ctr_count_maps: Vec<HashMap<i64, f64>>, // Per-feature category -> log1p(full-train count).
     pub(super) ordered_ctr_pair_features: Vec<(usize, usize)>, // GCE: trained categorical pair sources.
@@ -333,6 +477,9 @@ pub struct GTBoostModel {
     pub(super) lookahead_alpha: f64, // LAS: 1-step look-ahead split selection. score = gain + α·max(child_L_gain, child_R_gain). 0 = greedy, typical 0.2-0.5.
     pub(super) sign_confidence_gamma: f64, // SCS: shrink leaf by (|Σsign(g)|/n)^γ. Mixed-sign leaves → low confidence → shrink toward 0. 0 = off, typical 0.5-2.0.
     pub(super) soft_predict_bandwidth: f64, // SRP: soft routing at predict time. σ((thresh - val) / (bw · feat_scale)). 0 = hard routing, typical 0.3-1.0.
+    pub(super) soft_leaf_bandwidth: f64, // SCB: train-consistent smooth boosting. After fit, refit constant leaves under soft routing at this bandwidth, then predict softly. 0 = off. Binary/regression only.
+    pub(super) soft_leaf_passes: usize, // number of cyclic soft leaf-refit passes over the trees (coordinate descent on the residual). Typical 1-2.
+    pub(super) leaf_var_shrink: f64, // VLS: variance-aware leaf shrinkage exponent. Scale each leaf by gradient reliability^this. 0 = off, typical 0.5-2.0.
     pub(super) jensen_train_temp: f64, // Jensen-aware training: divide predictions by T before softmax during multiclass gradient computation. T=1 = off, T>1 aligns training with test-time PD smoothing (Jensen gap).
     pub(super) diversity_penalty: f64, // §2: feature-usage EMA penalty on make_feature_mask. Features used in recent trees get lower inclusion prob. 0 = off, 0.2-0.8 typical.
     pub(super) diversity_decay: f64, // §2: EMA decay per tree for feature usage tracking. 0.9 = ~10-tree memory, 0.95 = ~20-tree memory.
@@ -390,6 +537,7 @@ impl GTBoostModel {
         self.n_classes = 0;
         self.multiclass_trees_per_class = 1;
         self.multiclass_tree_lr_scale = 1.0;
+        self.vertical_prior = VerticalPrior::default();
         self.cat_offset_maps.clear();
         self.numeric_interaction_pairs.clear();
         self.numeric_interaction_edges.clear();
@@ -398,6 +546,23 @@ impl GTBoostModel {
         self.sumdiff_pairs.clear();
         self.sumdiff_edges.clear();
         self.feature_usage_ema.clear();
+        self.ordered_ctr_features.clear();
+        self.ordered_ctr_priors.clear();
+        self.ordered_ctr_maps.clear();
+        self.ordered_ctr_count_maps.clear();
+        self.ordered_ctr_pair_features.clear();
+        self.ordered_ctr_pair_maps.clear();
+        self.ordered_ctr_pair_count_maps.clear();
+        self.ordered_ctr_triple_features.clear();
+        self.ordered_ctr_triple_maps.clear();
+        self.ordered_ctr_triple_count_maps.clear();
+        self.ordered_ctr_prior = 0.0;
+        self.cfe_tuples.clear();
+        self.cfe_tables.clear();
+        self.cfe_prior.clear();
+        self.cfe_n_out = 0;
+        self.cfe_resid_tables.clear();
+        self.cfe_resid_prior = 0.0;
     }
 
     fn compute_base_scores_for_fit(
@@ -501,6 +666,378 @@ impl GTBoostModel {
             _ => {}
         }
     }
+
+    fn fit_vertical_prior_for_binary(
+        &mut self,
+        x_data: &[f64],
+        y_data: &[f64],
+        n_rows: usize,
+        n_features: usize,
+        sample_weight_data: Option<&[f64]>,
+    ) -> Option<Vec<f64>> {
+        if x_data.len() < n_rows.saturating_mul(n_features) || y_data.len() != n_rows {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+
+        let max_bins = ((n_rows as f64).sqrt().round() as usize).clamp(4, 64);
+        let reg = (0.35 * (n_rows as f64).sqrt().max(n_features as f64)).max(1.0);
+        let cat_features = if self.cat_features.len() == n_features {
+            self.cat_features.clone()
+        } else {
+            vec![false; n_features]
+        };
+
+        let mut edges: Vec<Vec<f64>> = Vec::with_capacity(n_features);
+        let mut effects: Vec<Vec<f64>> = Vec::with_capacity(n_features);
+        let mut bins: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+
+        for feat in 0..n_features {
+            if cat_features.get(feat).copied().unwrap_or(false) {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            let mut vals: Vec<f64> = (0..n_rows)
+                .map(|row| x_data[row * n_features + feat])
+                .filter(|v| v.is_finite())
+                .collect();
+            if vals.len() < 8 {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let min_v = vals[0];
+            let max_v = vals[vals.len() - 1];
+            if !(max_v > min_v) {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            let n_bins = max_bins.min(((vals.len() as f64).sqrt().round() as usize).max(4));
+            let mut feat_edges = Vec::with_capacity(n_bins.saturating_sub(1));
+            for q in 1..n_bins {
+                let pos =
+                    ((q as f64) * ((vals.len() - 1) as f64) / (n_bins as f64)).round() as usize;
+                let edge = vals[pos.min(vals.len() - 1)];
+                if feat_edges.last().map(|last| edge > *last).unwrap_or(true) {
+                    feat_edges.push(edge);
+                }
+            }
+            let mut feat_bins = Vec::with_capacity(n_rows);
+            for row in 0..n_rows {
+                let v = x_data[row * n_features + feat];
+                feat_bins.push(VerticalPrior::bin_index(&feat_edges, v));
+            }
+            let n_effects = feat_edges.len() + 2;
+            edges.push(feat_edges);
+            effects.push(vec![0.0; n_effects]);
+            bins.push(feat_bins);
+        }
+
+        let row_weight = |row: usize, yv: f64, this: &GTBoostModel| -> f64 {
+            let sw = sample_weight_data
+                .and_then(|w| w.get(row).copied())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(1.0);
+            let cw = if this.class_weights.len() >= 2 {
+                if yv > 0.5 {
+                    this.class_weights[1].max(0.0)
+                } else {
+                    this.class_weights[0].max(0.0)
+                }
+            } else {
+                1.0
+            };
+            sw * cw
+        };
+
+        let logistic_loss = |pred: &[f64], eff: Option<(&[usize], &[f64])>| -> f64 {
+            let mut loss = 0.0f64;
+            for row in 0..n_rows {
+                let mut z = pred[row];
+                if let Some((feat_bins, feat_effects)) = eff {
+                    let b = feat_bins[row];
+                    if b < feat_effects.len() {
+                        z += feat_effects[b];
+                    }
+                }
+                let y = if y_data[row] > 0.5 { 1.0 } else { 0.0 };
+                let w = row_weight(row, y, self);
+                let zc = z.clamp(-30.0, 30.0);
+                loss += w * ((1.0 + zc.exp()).ln() - y * zc);
+            }
+            loss
+        };
+
+        let mut pred = vec![self.base_score; n_rows];
+        let cycles = self.vertical_init_cycles.max(1).min(8);
+        for _ in 0..cycles {
+            for feat in 0..n_features {
+                if effects[feat].len() <= 1 {
+                    continue;
+                }
+                for row in 0..n_rows {
+                    pred[row] -= effects[feat][bins[feat][row]];
+                }
+
+                let loss_before = logistic_loss(&pred, None);
+                let mut g_sums = vec![0.0f64; effects[feat].len()];
+                let mut h_sums = vec![0.0f64; effects[feat].len()];
+                for row in 0..n_rows {
+                    let z = pred[row].clamp(-30.0, 30.0);
+                    let p = 1.0 / (1.0 + (-z).exp());
+                    let y = if y_data[row] > 0.5 { 1.0 } else { 0.0 };
+                    let w = row_weight(row, y, self);
+                    let b = bins[feat][row];
+                    g_sums[b] += w * (p - y);
+                    h_sums[b] += w * (p * (1.0 - p)).max(1e-6);
+                }
+
+                let mut new_effects = vec![0.0f64; effects[feat].len()];
+                let mut center_num = 0.0;
+                let mut center_den = 0.0;
+                let mut edf = 0.0;
+                for b in 0..new_effects.len() {
+                    let h = h_sums[b];
+                    if h <= 1e-12 {
+                        continue;
+                    }
+                    let v = (-g_sums[b] / (h + reg)).clamp(-2.0, 2.0);
+                    new_effects[b] = v;
+                    center_num += v * h;
+                    center_den += h;
+                    edf += h / (h + reg);
+                }
+                if center_den > 0.0 {
+                    let center = center_num / center_den;
+                    for v in &mut new_effects {
+                        *v -= center;
+                    }
+                }
+
+                let loss_after = logistic_loss(&pred, Some((&bins[feat], &new_effects)));
+                let penalty = 0.02 * edf.max(1.0);
+                if loss_after + penalty < loss_before {
+                    effects[feat] = new_effects;
+                    for row in 0..n_rows {
+                        pred[row] += effects[feat][bins[feat][row]];
+                    }
+                } else {
+                    effects[feat].fill(0.0);
+                }
+            }
+        }
+
+        let has_signal = effects
+            .iter()
+            .any(|feat_effects| feat_effects.iter().any(|v| v.abs() > 1e-12));
+        if !has_signal {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+
+        self.vertical_prior = VerticalPrior {
+            mean: self.base_score,
+            edges,
+            effects,
+        };
+        Some(pred)
+    }
+
+    fn fit_vertical_prior_for_regression(
+        &mut self,
+        x_data: &[f64],
+        y_data: &[f64],
+        n_rows: usize,
+        n_features: usize,
+        sample_weight_data: Option<&[f64]>,
+    ) -> Option<Vec<f64>> {
+        if !self.vertical_init || n_rows == 0 || n_features == 0 {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+        if self.task == "binary" {
+            return self.fit_vertical_prior_for_binary(
+                x_data,
+                y_data,
+                n_rows,
+                n_features,
+                sample_weight_data,
+            );
+        }
+        if self.task != "regression" {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+        if x_data.len() < n_rows.saturating_mul(n_features) || y_data.len() != n_rows {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+
+        let mut weight_sum = 0.0;
+        let mut weighted_y_sum = 0.0;
+        for i in 0..n_rows {
+            let w = sample_weight_data
+                .and_then(|sw| sw.get(i).copied())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(1.0);
+            weight_sum += w;
+            weighted_y_sum += w * y_data[i];
+        }
+        let mean = if weight_sum > 0.0 {
+            weighted_y_sum / weight_sum
+        } else {
+            y_data.iter().sum::<f64>() / n_rows as f64
+        };
+
+        let max_bins = ((n_rows as f64).sqrt().round() as usize).clamp(4, 64);
+        // Empirical-Bayes style smoothing for one-feature vertical effects.
+        // The prior is intentionally conservative: it is only an initializer,
+        // and noisy marginal effects are worse than no initializer.
+        let reg = (n_rows as f64).sqrt().max(n_features as f64).max(1.0);
+        let cat_features = if self.cat_features.len() == n_features {
+            self.cat_features.clone()
+        } else {
+            vec![false; n_features]
+        };
+
+        let mut edges: Vec<Vec<f64>> = Vec::with_capacity(n_features);
+        let mut effects: Vec<Vec<f64>> = Vec::with_capacity(n_features);
+        let mut bins: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+
+        for feat in 0..n_features {
+            if cat_features.get(feat).copied().unwrap_or(false) {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            let mut vals: Vec<f64> = (0..n_rows)
+                .map(|row| x_data[row * n_features + feat])
+                .filter(|v| v.is_finite())
+                .collect();
+            if vals.len() < 4 {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let min_v = vals[0];
+            let max_v = vals[vals.len() - 1];
+            if !(max_v > min_v) {
+                edges.push(Vec::new());
+                effects.push(vec![0.0]);
+                bins.push(vec![0usize; n_rows]);
+                continue;
+            }
+            let n_bins = max_bins.min(((vals.len() as f64).sqrt().round() as usize).max(4));
+            let mut feat_edges = Vec::with_capacity(n_bins.saturating_sub(1));
+            for q in 1..n_bins {
+                let pos =
+                    ((q as f64) * ((vals.len() - 1) as f64) / (n_bins as f64)).round() as usize;
+                let edge = vals[pos.min(vals.len() - 1)];
+                if feat_edges.last().map(|last| edge > *last).unwrap_or(true) {
+                    feat_edges.push(edge);
+                }
+            }
+            let mut feat_bins = Vec::with_capacity(n_rows);
+            for row in 0..n_rows {
+                let v = x_data[row * n_features + feat];
+                feat_bins.push(VerticalPrior::bin_index(&feat_edges, v));
+            }
+            let n_effects = feat_edges.len() + 2;
+            edges.push(feat_edges);
+            effects.push(vec![0.0; n_effects]);
+            bins.push(feat_bins);
+        }
+
+        let mut pred = vec![mean; n_rows];
+        let cycles = self.vertical_init_cycles.max(1).min(8);
+        for _ in 0..cycles {
+            for feat in 0..n_features {
+                if effects[feat].len() <= 1 {
+                    continue;
+                }
+                for row in 0..n_rows {
+                    pred[row] -= effects[feat][bins[feat][row]];
+                }
+                let mut counts = vec![0.0f64; effects[feat].len()];
+                let mut sums = vec![0.0f64; effects[feat].len()];
+                for row in 0..n_rows {
+                    let b = bins[feat][row];
+                    let w = sample_weight_data
+                        .and_then(|sw| sw.get(row).copied())
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .unwrap_or(1.0);
+                    counts[b] += w;
+                    sums[b] += w * (y_data[row] - pred[row]);
+                }
+                let mut new_effects = vec![0.0f64; effects[feat].len()];
+                let mut center_num = 0.0;
+                let mut center_den = 0.0;
+                for b in 0..new_effects.len() {
+                    new_effects[b] = sums[b] / (counts[b] + reg);
+                    center_num += new_effects[b] * counts[b];
+                    center_den += counts[b];
+                }
+                if center_den > 0.0 {
+                    let center = center_num / center_den;
+                    for v in &mut new_effects {
+                        *v -= center;
+                    }
+                }
+
+                let mut rss_before = 0.0;
+                let mut rss_after = 0.0;
+                for row in 0..n_rows {
+                    let w = sample_weight_data
+                        .and_then(|sw| sw.get(row).copied())
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .unwrap_or(1.0);
+                    let r0 = y_data[row] - pred[row];
+                    let r1 = r0 - new_effects[bins[feat][row]];
+                    rss_before += w * r0 * r0;
+                    rss_after += w * r1 * r1;
+                }
+                let edf: f64 = counts
+                    .iter()
+                    .map(|&c| if c > 0.0 { c / (c + reg) } else { 0.0 })
+                    .sum();
+                let n_eff = center_den.max(1.0);
+                let leverage = (edf / n_eff).clamp(0.0, 0.95);
+                let gcv_after = rss_after / (1.0 - leverage).powi(2);
+                if gcv_after < rss_before {
+                    effects[feat] = new_effects;
+                    for row in 0..n_rows {
+                        pred[row] += effects[feat][bins[feat][row]];
+                    }
+                } else {
+                    effects[feat].fill(0.0);
+                }
+            }
+        }
+
+        let has_signal = effects
+            .iter()
+            .any(|feat_effects| feat_effects.iter().any(|v| v.abs() > 1e-12));
+        if !has_signal {
+            self.vertical_prior = VerticalPrior::default();
+            return None;
+        }
+
+        self.vertical_prior = VerticalPrior {
+            mean,
+            edges,
+            effects,
+        };
+        Some(pred)
+    }
 }
 
 #[pymethods]
@@ -511,6 +1048,8 @@ impl GTBoostModel {
         max_depth = 6,
         subsample_rate = 1.0,
         base_score = 0.0,
+        vertical_init = false,
+        vertical_init_cycles = 2,
         lambda_reg = 1.0,
         gamma = 0.0,
         min_child_weight = 1.0,
@@ -524,13 +1063,20 @@ impl GTBoostModel {
         n_leaf_splits = 0,
         refine_every = 0,
         early_stopping_rounds = 0,
+        eval_metric = "auto".to_string(),
         verbose = 0,
         l1_reg = 0.0,
         refine_alpha = 1.0,
         honest = false,
         honest_fraction = 0.5,
+        honest_arbitration = false,
+        feature_gain_prior = Vec::<f64>::new(),
+        thermal = 0.0,
+        stein_leaves = false,
+        stein_levels = false,
+        thermal_n_exp = 0.5,
+        thermal_depth_gamma = 1.0,
         colsample_bylevel = 1.0,
-        lr_decay = 1.0,
         n_trees_per_round = 1,
         cat_features = Vec::new(),
         grad_clip = 0.0,
@@ -541,20 +1087,32 @@ impl GTBoostModel {
         cat_lookup_smooth = 0.0,
         monotone_constraints = Vec::new(),
         max_cat_bins = 0,
-        ramp = false,
-        ramp_lambda = 10.0,
-        ramp_k = 1,
         leaf_linear = false,
         leaf_quadratic = false,
         leaf_correction = 0,
         grad_momentum = 0.0,
         gain_penalty = 0.0,
         split_pessimism = 0.0,
+        cat_audit_strength = 0.0,
+        split_contrast_penalty = 0.0,
+        signal_gate = 0.0,
+        supervised_bins = false,
+        fold_ordered = 0,
+        cat_fold_evidence = false,
+        cfe_max_pairs = 12,
+        cfe_max_triples = 8,
+        cfe_max_quads = 6,
+        cfe_smooth = 20.0,
+        cfe_demote_raw = true,
+        cfe_demote_min_card = 64,
         self_score_splits = false,
         hetero_trees = false,
         dart_rate = 0.0,
         max_delta_step = 0.0,
+        main_effect_interval = 0,
+        main_effect_depth = 1,
         cyclic_features = false,
+        cyclic_max_features_per_round = 0,
         auto_interactions = false,
         auto_cat_interactions = false,
         max_interaction_features = 20,
@@ -563,8 +1121,7 @@ impl GTBoostModel {
         extra_trees = false,
         label_smooth = 0.0,
         multi_output_tree = false,
-        prob_avg = false,
-        honest_tau = 0.0,
+        multiclass_pair_sequence = false,
         complement_debias_mode = 0,
         phase_schedule = "".to_string(),
         ncl_lambda = 0.0,
@@ -574,22 +1131,23 @@ impl GTBoostModel {
         cyclic_partner_bins = 8,
         cyclic_feature_reuse = false,
         cyclic_revisit_trees = 0,
-        cyclic_revisit_min_pressure_ratio = 0.0,
-        adaptive_feature_mask = false,
-        adaptive_feature_mask_penalty = 0.5,
         adaptive_root_anchor = false,
-        adaptive_root_anchor_penalty = 0.5,
         sparse_oblique_splits = false,
         interval_splits = false,
-        sibling_block_correction = 0.0,
         adam_beta2 = 0.0,
         adam_eps = 1e-8,
         ortho_alpha = 0.0,
         split_criterion = "newton".to_string(),
         rank_mix_alpha = 0.0,
         rank_mix_start_frac = 0.0,
+        rank_pair_temperature = 1.0,
         binary_focus_gamma = 0.0,
         binary_focus_end_frac = 0.0,
+        residual_focus_alpha = 0.0,
+        residual_focus_max_scale = 2.0,
+        residual_focus_mode = "full".to_string(),
+        residual_focus_hessian_mode = "equal".to_string(),
+        residual_focus_redescend_tau = 0.0,
         feature_view_groups = Vec::new(),
         leaf_trim_pct = 0.0,
         leaf_median = false,
@@ -597,60 +1155,35 @@ impl GTBoostModel {
         leaf_mad_clip = 0.0,
         leaf_adaptive_blend_kappa = 0.0,
         ordered_boost = false,
-        ordered_n_buckets = 4,
         goss_top_rate = 0.0,
         goss_other_rate = 0.0,
-        goss_mode = "newton".to_string(),
-        goss_anneal = 0.0,
         keep_all_trees = false,
         corrective_block_refit = false,
         corrective_blocks = 16,
         corrective_lambda = 1.0,
         corrective_blend = 1.0,
-        corrective_min_trees = 16,
         corrective_audit_fraction = 0.0,
-        corrective_min_rel_improve = 0.0,
         leaf_eb = false,
         leaf_eb_min_trees = 10,
         leaf_eb_scale = 1.0,
         leaf_sibling_smooth = 0.0,
         hierarchical_shrinkage = 0.0,
         multiclass_coupled_leaves = false,
-        multiclass_joint_cll = false,
         class_weights = Vec::<f64>::new(),
         adaptive_leaf_experts = false,
         adaptive_cat_lookup_smooth = false,
         cat_offset_smooth = 0.0,
         cat_offset_passes = 0,
-        ordered_ctr = false,
-        ordered_ctr_top_features = 16,
-        ordered_ctr_smooth = 30.0,
-        ordered_ctr_permutations = 1,
-        ordered_ctr_min_count = 2,
-        cat_tuple_lookups = false,
-        cat_tuple_max_order = 3,
-        cat_tuple_top_features = 5,
-        cat_tuple_hash_bins = 128,
-        cat_tuple_min_leaf = 64,
-        cat_tuple_gain_margin = 0.05,
         expert_leaf_admission = false,
-        expert_max_terms = 2,
         expert_min_leaf = 64,
-        expert_min_cal = 12,
-        expert_ridge_lambda = 25.0,
-        expert_alpha_max = 1.0,
-        expert_param_penalty = 1e-4,
-        expert_se_multiplier = 0.5,
-        expert_epsilon = 1e-5,
-        expert_shadow_trials = 0,
-        antithetic_subtrees = false,
         newton_decrement_cap = 0.0,
         lookahead_alpha = 0.0,
         sign_confidence_gamma = 0.0,
         soft_predict_bandwidth = 0.0,
+        soft_leaf_bandwidth = 0.0,
+        soft_leaf_passes = 1,
+        leaf_var_shrink = 0.0,
         jensen_train_temp = 1.0,
-        diversity_penalty = 0.0,
-        diversity_decay = 0.9,
         jit_catpair_enabled = false,
         jit_catpair_top_k = 4,
         jit_catpair_k_buckets = 8,
@@ -664,6 +1197,8 @@ impl GTBoostModel {
         max_depth: usize,
         subsample_rate: f64,
         base_score: f64,
+        vertical_init: bool,
+        vertical_init_cycles: usize,
         lambda_reg: f64,
         gamma: f64,
         min_child_weight: f64,
@@ -677,13 +1212,20 @@ impl GTBoostModel {
         n_leaf_splits: usize,
         refine_every: usize,
         early_stopping_rounds: usize,
+        eval_metric: String,
         verbose: usize,
         l1_reg: f64,
         refine_alpha: f64,
         honest: bool,
         honest_fraction: f64,
+        honest_arbitration: bool,
+        feature_gain_prior: Vec<f64>,
+        thermal: f64,
+        stein_leaves: bool,
+        stein_levels: bool,
+        thermal_n_exp: f64,
+        thermal_depth_gamma: f64,
         colsample_bylevel: f64,
-        lr_decay: f64,
         n_trees_per_round: usize,
         cat_features: Vec<bool>,
         grad_clip: f64,
@@ -694,20 +1236,32 @@ impl GTBoostModel {
         cat_lookup_smooth: f64,
         monotone_constraints: Vec<i8>,
         max_cat_bins: usize,
-        ramp: bool,
-        ramp_lambda: f64,
-        ramp_k: usize,
         leaf_linear: bool,
         leaf_quadratic: bool,
         leaf_correction: usize,
         grad_momentum: f64,
         gain_penalty: f64,
         split_pessimism: f64,
+        cat_audit_strength: f64,
+        split_contrast_penalty: f64,
+        signal_gate: f64,
+        supervised_bins: bool,
+        fold_ordered: usize,
+        cat_fold_evidence: bool,
+        cfe_max_pairs: usize,
+        cfe_max_triples: usize,
+        cfe_max_quads: usize,
+        cfe_smooth: f64,
+        cfe_demote_raw: bool,
+        cfe_demote_min_card: usize,
         self_score_splits: bool,
         hetero_trees: bool,
         dart_rate: f64,
         max_delta_step: f64,
+        main_effect_interval: usize,
+        main_effect_depth: usize,
         cyclic_features: bool,
+        cyclic_max_features_per_round: usize,
         auto_interactions: bool,
         auto_cat_interactions: bool,
         max_interaction_features: usize,
@@ -716,8 +1270,7 @@ impl GTBoostModel {
         extra_trees: bool,
         label_smooth: f64,
         multi_output_tree: bool,
-        prob_avg: bool,
-        honest_tau: f64,
+        multiclass_pair_sequence: bool,
         complement_debias_mode: u8,
         phase_schedule: String,
         ncl_lambda: f64,
@@ -727,22 +1280,23 @@ impl GTBoostModel {
         cyclic_partner_bins: usize,
         cyclic_feature_reuse: bool,
         cyclic_revisit_trees: usize,
-        cyclic_revisit_min_pressure_ratio: f64,
-        adaptive_feature_mask: bool,
-        adaptive_feature_mask_penalty: f64,
         adaptive_root_anchor: bool,
-        adaptive_root_anchor_penalty: f64,
         sparse_oblique_splits: bool,
         interval_splits: bool,
-        sibling_block_correction: f64,
         adam_beta2: f64,
         adam_eps: f64,
         ortho_alpha: f64,
         split_criterion: String,
         rank_mix_alpha: f64,
         rank_mix_start_frac: f64,
+        rank_pair_temperature: f64,
         binary_focus_gamma: f64,
         binary_focus_end_frac: f64,
+        residual_focus_alpha: f64,
+        residual_focus_max_scale: f64,
+        residual_focus_mode: String,
+        residual_focus_hessian_mode: String,
+        residual_focus_redescend_tau: f64,
         feature_view_groups: Vec<u32>,
         leaf_trim_pct: f64,
         leaf_median: bool,
@@ -750,60 +1304,35 @@ impl GTBoostModel {
         leaf_mad_clip: f64,
         leaf_adaptive_blend_kappa: f64,
         ordered_boost: bool,
-        ordered_n_buckets: usize,
         goss_top_rate: f64,
         goss_other_rate: f64,
-        goss_mode: String,
-        goss_anneal: f64,
         keep_all_trees: bool,
         corrective_block_refit: bool,
         corrective_blocks: usize,
         corrective_lambda: f64,
         corrective_blend: f64,
-        corrective_min_trees: usize,
         corrective_audit_fraction: f64,
-        corrective_min_rel_improve: f64,
         leaf_eb: bool,
         leaf_eb_min_trees: usize,
         leaf_eb_scale: f64,
         leaf_sibling_smooth: f64,
         hierarchical_shrinkage: f64,
         multiclass_coupled_leaves: bool,
-        multiclass_joint_cll: bool,
         class_weights: Vec<f64>,
         adaptive_leaf_experts: bool,
         adaptive_cat_lookup_smooth: bool,
         cat_offset_smooth: f64,
         cat_offset_passes: usize,
-        ordered_ctr: bool,
-        ordered_ctr_top_features: usize,
-        ordered_ctr_smooth: f64,
-        ordered_ctr_permutations: usize,
-        ordered_ctr_min_count: usize,
-        cat_tuple_lookups: bool,
-        cat_tuple_max_order: usize,
-        cat_tuple_top_features: usize,
-        cat_tuple_hash_bins: usize,
-        cat_tuple_min_leaf: usize,
-        cat_tuple_gain_margin: f64,
         expert_leaf_admission: bool,
-        expert_max_terms: usize,
         expert_min_leaf: usize,
-        expert_min_cal: usize,
-        expert_ridge_lambda: f64,
-        expert_alpha_max: f64,
-        expert_param_penalty: f64,
-        expert_se_multiplier: f64,
-        expert_epsilon: f64,
-        expert_shadow_trials: usize,
-        antithetic_subtrees: bool,
         newton_decrement_cap: f64,
         lookahead_alpha: f64,
         sign_confidence_gamma: f64,
         soft_predict_bandwidth: f64,
+        soft_leaf_bandwidth: f64,
+        soft_leaf_passes: usize,
+        leaf_var_shrink: f64,
         jensen_train_temp: f64,
-        diversity_penalty: f64,
-        diversity_decay: f64,
         jit_catpair_enabled: bool,
         jit_catpair_top_k: usize,
         jit_catpair_k_buckets: u8,
@@ -818,6 +1347,9 @@ impl GTBoostModel {
             subsample_rate,
             base_score,
             class_base_scores: Vec::new(),
+            vertical_init,
+            vertical_init_cycles: vertical_init_cycles.max(1),
+            vertical_prior: VerticalPrior::default(),
             lambda_reg,
             gamma,
             min_child_weight,
@@ -831,13 +1363,22 @@ impl GTBoostModel {
             n_leaf_splits,
             refine_every,
             early_stopping_rounds,
+            eval_metric,
             verbose,
             l1_reg,
             refine_alpha,
             honest,
             honest_fraction,
+            honest_arbitration,
+            feature_gain_prior,
+            thermal: thermal.max(0.0),
+            stein_leaves,
+            stein_levels,
+            thermal_n_exp,
+            thermal_depth_gamma,
+            split_audit_fraction: 0.0,
             colsample_bylevel,
-            lr_decay,
+            lr_decay: 1.0,
             n_trees_per_round: n_trees_per_round.max(1),
             cat_features,
             grad_clip,
@@ -848,20 +1389,47 @@ impl GTBoostModel {
             cat_lookup_smooth,
             monotone_constraints,
             max_cat_bins,
-            ramp,
-            ramp_lambda,
-            ramp_k: ramp_k.max(1),
+            ramp: false,
+            ramp_lambda: 10.0,
+            ramp_k: 1,
             leaf_linear,
             leaf_quadratic,
             leaf_correction,
             grad_momentum: grad_momentum.clamp(0.0, 0.99),
             gain_penalty: gain_penalty.max(0.0),
             split_pessimism: split_pessimism.max(0.0),
+            cat_prototype_bins: 0,
+            cat_audit_strength: cat_audit_strength.max(0.0),
+            split_contrast_penalty: split_contrast_penalty.max(0.0),
+            signal_gate: signal_gate.max(0.0),
+            supervised_bins,
+            fold_ordered: if fold_ordered == 1 { 2 } else { fold_ordered.min(16) },
+            cat_fold_evidence,
+            cfe_folds: 5,
+            cfe_max_pairs: cfe_max_pairs.min(64),
+            cfe_max_triples: cfe_max_triples.min(64),
+            cfe_max_quads: cfe_max_quads.min(64),
+            cfe_dual_prior: false,
+            cfe_counter: false,
+            cfe_aggmax: true,
+            cfe_smooth: cfe_smooth.max(1e-6),
+            cfe_demote_raw,
+            cfe_demote_min_card: cfe_demote_min_card.max(2),
+            cfe_residual_rounds: 0,
+            cfe_resid_tables: Vec::new(),
+            cfe_resid_prior: 0.0,
+            cfe_tuples: Vec::new(),
+            cfe_tables: Vec::new(),
+            cfe_prior: Vec::new(),
+            cfe_n_out: 0,
             self_score_splits,
             hetero_trees,
             dart_rate: dart_rate.clamp(0.0, 0.9),
             max_delta_step: max_delta_step.max(0.0),
+            main_effect_interval,
+            main_effect_depth: main_effect_depth.clamp(1, 4),
             cyclic_features,
+            cyclic_max_features_per_round,
             auto_interactions,
             auto_cat_interactions,
             max_interaction_features,
@@ -870,8 +1438,9 @@ impl GTBoostModel {
             extra_trees,
             label_smooth: label_smooth.clamp(0.0, 0.5),
             multi_output_tree,
-            prob_avg,
-            honest_tau: honest_tau.max(0.0),
+            multiclass_pair_sequence,
+            prob_avg: false,
+            honest_tau: 0.0,
             complement_debias_mode: complement_debias_mode.min(3),
             phase_schedule,
             ncl_lambda: ncl_lambda.max(0.0),
@@ -881,22 +1450,28 @@ impl GTBoostModel {
             cyclic_partner_bins: cyclic_partner_bins.clamp(2, 32),
             cyclic_feature_reuse,
             cyclic_revisit_trees,
-            cyclic_revisit_min_pressure_ratio: cyclic_revisit_min_pressure_ratio.clamp(0.0, 1.0),
-            adaptive_feature_mask,
-            adaptive_feature_mask_penalty: adaptive_feature_mask_penalty.clamp(0.0, 5.0),
+            cyclic_revisit_min_pressure_ratio: 0.0,
+            adaptive_feature_mask: false,
+            adaptive_feature_mask_penalty: 0.5,
             adaptive_root_anchor,
-            adaptive_root_anchor_penalty: adaptive_root_anchor_penalty.clamp(0.0, 5.0),
+            adaptive_root_anchor_penalty: 0.5,
             sparse_oblique_splits,
             interval_splits,
-            sibling_block_correction: sibling_block_correction.clamp(0.0, 1.0),
+            sibling_block_correction: 0.0,
             adam_beta2: adam_beta2.clamp(0.0, 0.9999),
             adam_eps: adam_eps.max(1e-12),
             ortho_alpha: ortho_alpha.clamp(0.0, 2.0),
             split_criterion,
             rank_mix_alpha: rank_mix_alpha.clamp(0.0, 1.0),
             rank_mix_start_frac: rank_mix_start_frac.clamp(0.0, 1.0),
+            rank_pair_temperature: rank_pair_temperature.clamp(0.05, 20.0),
             binary_focus_gamma: binary_focus_gamma.clamp(0.0, 4.0),
             binary_focus_end_frac: binary_focus_end_frac.clamp(0.0, 1.0),
+            residual_focus_alpha: residual_focus_alpha.clamp(0.0, 4.0),
+            residual_focus_max_scale: residual_focus_max_scale.max(1.0).min(8.0),
+            residual_focus_mode,
+            residual_focus_hessian_mode,
+            residual_focus_redescend_tau: residual_focus_redescend_tau.max(0.0),
             feature_view_groups,
             leaf_trim_pct: leaf_trim_pct.clamp(0.0, 0.49),
             leaf_median,
@@ -904,39 +1479,40 @@ impl GTBoostModel {
             leaf_mad_clip: leaf_mad_clip.max(0.0),
             leaf_adaptive_blend_kappa: leaf_adaptive_blend_kappa.max(0.0),
             ordered_boost,
-            ordered_n_buckets: ordered_n_buckets.max(2).min(16),
+            ordered_n_buckets: 4,
             goss_top_rate: goss_top_rate.clamp(0.0, 0.99),
             goss_other_rate: goss_other_rate.clamp(0.0, 0.99),
-            goss_mode,
-            goss_anneal: goss_anneal.clamp(0.0, 0.8),
+            goss_mode: "newton".to_string(),
+            goss_anneal: 0.0,
             keep_all_trees,
             corrective_block_refit,
             corrective_blocks: corrective_blocks.clamp(1, 256),
             corrective_lambda: corrective_lambda.max(0.0),
             corrective_blend: corrective_blend.clamp(0.0, 1.0),
-            corrective_min_trees: corrective_min_trees.max(2),
+            corrective_min_trees: 16,
             corrective_audit_fraction: corrective_audit_fraction.clamp(0.0, 0.5),
-            corrective_min_rel_improve: corrective_min_rel_improve.clamp(0.0, 0.5),
+            corrective_min_rel_improve: 0.0,
             leaf_eb,
             leaf_eb_min_trees: leaf_eb_min_trees.max(5),
             leaf_eb_scale: leaf_eb_scale.max(0.0),
             leaf_sibling_smooth: leaf_sibling_smooth.clamp(0.0, 0.5),
             hierarchical_shrinkage: hierarchical_shrinkage.max(0.0),
             multiclass_coupled_leaves,
-            multiclass_joint_cll,
+            multiclass_joint_cll: false,
             class_weights,
             adaptive_leaf_experts,
             adaptive_cat_lookup_smooth,
             cat_offset_smooth: cat_offset_smooth.max(0.0),
             cat_offset_passes: cat_offset_passes.min(4),
             cat_offset_maps: Vec::new(),
-            ordered_ctr,
-            ordered_ctr_top_features: ordered_ctr_top_features.min(128),
-            ordered_ctr_smooth: ordered_ctr_smooth.max(0.0),
-            ordered_ctr_permutations: ordered_ctr_permutations.clamp(1, 8),
-            ordered_ctr_min_count: ordered_ctr_min_count.max(1),
+            ordered_ctr: false,
+            ordered_ctr_top_features: 16,
+            ordered_ctr_smooth: 30.0,
+            ordered_ctr_permutations: 1,
+            ordered_ctr_min_count: 2,
             ordered_ctr_features: Vec::new(),
             ordered_ctr_prior: 0.0,
+            ordered_ctr_priors: Vec::new(),
             ordered_ctr_maps: Vec::new(),
             ordered_ctr_count_maps: Vec::new(),
             ordered_ctr_pair_features: Vec::new(),
@@ -945,30 +1521,36 @@ impl GTBoostModel {
             ordered_ctr_triple_features: Vec::new(),
             ordered_ctr_triple_maps: Vec::new(),
             ordered_ctr_triple_count_maps: Vec::new(),
-            cat_tuple_lookups,
-            cat_tuple_max_order: cat_tuple_max_order.clamp(2, 3),
-            cat_tuple_top_features: cat_tuple_top_features.clamp(2, 12),
-            cat_tuple_hash_bins: cat_tuple_hash_bins.clamp(8, 512),
-            cat_tuple_min_leaf: cat_tuple_min_leaf.max(2),
-            cat_tuple_gain_margin: cat_tuple_gain_margin.max(0.0),
+            cat_tuple_lookups: false,
+            cat_tuple_max_order: 3,
+            cat_tuple_top_features: 5,
+            cat_tuple_hash_bins: 128,
+            cat_tuple_min_leaf: 64,
+            cat_tuple_gain_margin: 0.05,
             expert_leaf_admission,
-            expert_max_terms,
+            expert_max_terms: 2,
             expert_min_leaf,
-            expert_min_cal,
-            expert_ridge_lambda,
-            expert_alpha_max,
-            expert_param_penalty,
-            expert_se_multiplier,
-            expert_epsilon,
-            expert_shadow_trials: expert_shadow_trials.min(8),
-            antithetic_subtrees,
+            expert_min_cal: 12,
+            expert_ridge_lambda: 25.0,
+            expert_alpha_max: 1.0,
+            expert_param_penalty: 1e-4,
+            expert_se_multiplier: 0.5,
+            expert_epsilon: 1e-5,
+            expert_shadow_trials: 0,
+            antithetic_subtrees: false,
             newton_decrement_cap: newton_decrement_cap.max(0.0),
             lookahead_alpha: lookahead_alpha.clamp(0.0, 2.0),
             sign_confidence_gamma: sign_confidence_gamma.clamp(0.0, 5.0),
             soft_predict_bandwidth: soft_predict_bandwidth.clamp(0.0, 5.0),
+            // Negative bandwidth is the documented AUTO mode for
+            // validation-selected soft-consistent leaf refit. Preserve it here;
+            // the training path decides whether a soft model is accepted.
+            soft_leaf_bandwidth: soft_leaf_bandwidth.clamp(-1.0, 5.0),
+            soft_leaf_passes: soft_leaf_passes.min(6),
+            leaf_var_shrink: leaf_var_shrink.clamp(0.0, 5.0),
             jensen_train_temp: jensen_train_temp.clamp(0.5, 5.0),
-            diversity_penalty: diversity_penalty.clamp(0.0, 1.0),
-            diversity_decay: diversity_decay.clamp(0.5, 0.999),
+            diversity_penalty: 0.0,
+            diversity_decay: 0.9,
             feature_usage_ema: Vec::new(),
             jit_catpair_enabled,
             jit_catpair_top_k: jit_catpair_top_k.max(2),
@@ -996,7 +1578,7 @@ impl GTBoostModel {
         }
     }
 
-    #[pyo3(signature = (x, y, n_rounds, eval_x = None, eval_y = None, init_score = None, sample_weight = None))]
+    #[pyo3(signature = (x, y, n_rounds, eval_x = None, eval_y = None, init_score = None, eval_init_score = None, sample_weight = None))]
     pub fn fit(
         &mut self,
         py: Python<'_>,
@@ -1006,6 +1588,7 @@ impl GTBoostModel {
         eval_x: Option<Bound<'_, PyAny>>,
         eval_y: Option<Bound<'_, PyAny>>,
         init_score: Option<Bound<'_, PyAny>>,
+        eval_init_score: Option<Bound<'_, PyAny>>,
         sample_weight: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let x_array: Bound<'_, PyArray2<f64>> = x.extract()?;
@@ -1026,10 +1609,8 @@ impl GTBoostModel {
         let y_data: Vec<f64> = y_array.to_owned_array().into_raw_vec_and_offset().0;
 
         // Optional init_score: per-row base offset added to predictions before
-        // boosting begins. The trees fit residuals against this offset; predict()
-        // callers must pass the matching init_score for new rows. Currently
-        // wired only for binary/regression — multiclass falls through to
-        // class_base_scores even when this is set.
+        // boosting begins. Binary/regression use one margin per row; multiclass
+        // uses a flat row-major matrix with n_rows * n_classes margins.
         let init_score_data: Option<Vec<f64>> = match init_score {
             Some(s) => {
                 let arr: Bound<'_, PyArray1<f64>> = s.extract().map_err(|_| {
@@ -1038,11 +1619,17 @@ impl GTBoostModel {
                     )
                 })?;
                 let v: Vec<f64> = arr.to_owned_array().into_raw_vec_and_offset().0;
-                if v.len() != n_rows {
+                let expected_len = if self.task == "multiclass" {
+                    let n_classes = y_data.iter().map(|&vv| vv as usize).max().unwrap_or(0) + 1;
+                    n_rows.saturating_mul(n_classes)
+                } else {
+                    n_rows
+                };
+                if v.len() != expected_len {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "init_score length ({}) must equal n_rows ({})",
+                        "init_score length ({}) must equal expected length ({})",
                         v.len(),
-                        n_rows
+                        expected_len
                     )));
                 }
                 Some(v)
@@ -1092,6 +1679,37 @@ impl GTBoostModel {
                 None
             };
 
+        let eval_init_score_data: Option<Vec<f64>> = match eval_init_score {
+            Some(s) => {
+                let Some((_, _, en_rows)) = eval_data_raw.as_ref() else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "eval_init_score requires eval_x/eval_y",
+                    ));
+                };
+                let arr: Bound<'_, PyArray1<f64>> = s.extract().map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "eval_init_score must be a 1-D float64 numpy array",
+                    )
+                })?;
+                let v: Vec<f64> = arr.to_owned_array().into_raw_vec_and_offset().0;
+                let expected_len = if self.task == "multiclass" {
+                    let n_classes = y_data.iter().map(|&vv| vv as usize).max().unwrap_or(0) + 1;
+                    en_rows.saturating_mul(n_classes)
+                } else {
+                    *en_rows
+                };
+                if v.len() != expected_len {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "eval_init_score length ({}) must equal expected length ({})",
+                        v.len(),
+                        expected_len
+                    )));
+                }
+                Some(v)
+            }
+            None => None,
+        };
+
         // Adaptive thread pool: parallelism is profitable only when the work
         // per task exceeds dispatch overhead. With Rayon's ~20µs/thread
         // overhead and ~ns-scale tree ops, we want roughly one thread per
@@ -1100,6 +1718,7 @@ impl GTBoostModel {
         let max_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
+        let subtrees_per_round = self.subtrees_per_boosting_round(n_features);
         let tree_work_multiplier = if self.task == "multiclass" {
             let n_classes = y_data
                 .iter()
@@ -1110,12 +1729,10 @@ impl GTBoostModel {
                 + 1;
             n_rounds
                 .max(1)
-                .saturating_mul(self.n_trees_per_round.max(1))
+                .saturating_mul(subtrees_per_round)
                 .saturating_mul(n_classes.max(1))
         } else {
-            n_rounds
-                .max(1)
-                .saturating_mul(self.n_trees_per_round.max(1))
+            n_rounds.max(1).saturating_mul(subtrees_per_round)
         };
         let work_estimate = n_rows
             .saturating_mul(n_features)
@@ -1135,15 +1752,68 @@ impl GTBoostModel {
         py.detach(|| {
             adaptive_pool.install(|| -> PyResult<()> {
                 let effective_bins = self.num_bins.min(32.max(n_rows / 4));
+                // DP bins: bin numerics on a finer quantile grid first, then
+                // DP-merge down to effective_bins where the initial gradient
+                // profile changes (see BinnedData::supervised_merge).
+                let build_bins = if self.supervised_bins {
+                    effective_bins
+                        .saturating_mul(4)
+                        .min(512)
+                        .min(32.max(n_rows / 2))
+                        .max(effective_bins)
+                } else {
+                    effective_bins
+                };
                 let mut binned = BinnedData::new(
                     &x_data,
                     n_rows,
                     n_features,
-                    effective_bins,
+                    build_bins,
                     &self.cat_features,
                     self.max_cat_bins,
                 );
+                if self.supervised_bins && build_bins > effective_bins {
+                    let n_outputs = if self.task == "multiclass" {
+                        (y_data
+                            .iter()
+                            .map(|&v| v as usize)
+                            .max()
+                            .unwrap_or(0)
+                            + 1)
+                            .max(2)
+                    } else {
+                        1
+                    };
+                    let mut scores = vec![0.0f64; n_rows * n_outputs];
+                    if n_outputs == 1 {
+                        let mean = y_data.iter().sum::<f64>() / n_rows.max(1) as f64;
+                        for (row, &yv) in y_data.iter().enumerate().take(n_rows) {
+                            scores[row] = yv - mean;
+                        }
+                    } else {
+                        let mut prior = vec![0.0f64; n_outputs];
+                        for &yv in y_data.iter().take(n_rows) {
+                            let k = (yv as usize).min(n_outputs - 1);
+                            prior[k] += 1.0;
+                        }
+                        for p in prior.iter_mut() {
+                            *p /= n_rows.max(1) as f64;
+                        }
+                        for (row, &yv) in y_data.iter().enumerate().take(n_rows) {
+                            let k = (yv as usize).min(n_outputs - 1);
+                            for j in 0..n_outputs {
+                                scores[row * n_outputs + j] =
+                                    (if j == k { 1.0 } else { 0.0 }) - prior[j];
+                            }
+                        }
+                    }
+                    binned.supervised_merge(&scores, n_outputs, effective_bins);
+                }
                 binned.split_pessimism = self.split_pessimism;
+                binned.cat_prototype_bins = self.cat_prototype_bins;
+                binned.cat_audit_strength = self.cat_audit_strength;
+                binned.split_contrast_penalty = self.split_contrast_penalty;
+                binned.signal_gate = self.signal_gate;
 
                 // (LTSO Phase 3 moved below all data augmentation — see post-eval block.)
 
@@ -1233,32 +1903,59 @@ impl GTBoostModel {
                                 )
                             })
                             .collect();
-                        scored_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                        scored_pairs.truncate(max_pairs);
+                        scored_pairs.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
 
-                        if self.auto_interactions && !scored_pairs.is_empty() {
-                            let selected_pairs: Vec<(usize, usize)> =
-                                scored_pairs.iter().map(|(p, _)| *p).collect();
-                            let product_cols: Vec<Vec<f64>> = selected_pairs
-                                .iter()
-                                .map(|&(fi, fj)| {
-                                    (0..n_rows)
-                                        .map(|row| {
-                                            let vi = x_data[row * n_features + fi];
-                                            let vj = x_data[row * n_features + fj];
-                                            if vi.is_nan() || vj.is_nan() {
-                                                f64::NAN
-                                            } else {
-                                                vi * vj
-                                            }
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-                            let int_start = binned.n_features;
-                            binned.add_ots_features(&product_cols, effective_bins);
-                            self.numeric_interaction_pairs = selected_pairs;
-                            self.numeric_interaction_edges = binned.bin_edges[int_start..].to_vec();
+                        if self.auto_interactions {
+                            let stable_pairs = self.stable_numeric_interaction_pairs(
+                                &x_data,
+                                &y_data,
+                                n_rows,
+                                n_features,
+                                &numeric_indices,
+                                max_pairs,
+                            );
+                            let stable_budget = (max_pairs / 2).max(1).min(max_pairs);
+                            let mut selected_pairs: Vec<(usize, usize)> = Vec::new();
+                            for (pair, _score) in stable_pairs.into_iter().take(stable_budget) {
+                                if !selected_pairs.contains(&pair) {
+                                    selected_pairs.push(pair);
+                                }
+                            }
+                            for (pair, _score) in scored_pairs.iter() {
+                                if selected_pairs.len() >= max_pairs {
+                                    break;
+                                }
+                                if !selected_pairs.contains(pair) {
+                                    selected_pairs.push(*pair);
+                                }
+                            }
+                            if !selected_pairs.is_empty() {
+                                let product_cols: Vec<Vec<f64>> = selected_pairs
+                                    .iter()
+                                    .map(|&(fi, fj)| {
+                                        (0..n_rows)
+                                            .map(|row| {
+                                                let vi = x_data[row * n_features + fi];
+                                                let vj = x_data[row * n_features + fj];
+                                                if vi.is_nan() || vj.is_nan() {
+                                                    f64::NAN
+                                                } else {
+                                                    vi * vj
+                                                }
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                let int_start = binned.n_features;
+                                binned.add_ots_features(&product_cols, effective_bins);
+                                self.numeric_interaction_pairs = selected_pairs;
+                                self.numeric_interaction_edges =
+                                    binned.bin_edges[int_start..].to_vec();
+                            }
                         }
 
                         if self.auto_cat_interactions
@@ -1283,7 +1980,11 @@ impl GTBoostModel {
                                     )
                                 })
                                 .collect();
-                            scored_cat_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                            scored_cat_pairs.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.0.cmp(&b.0))
+                            });
                             scored_cat_pairs.truncate(max_pairs.min(8));
 
                             if !scored_cat_pairs.is_empty() {
@@ -1329,6 +2030,81 @@ impl GTBoostModel {
                         let ctr_start = binned.n_features;
                         binned.add_ots_features(&ctr_cols, effective_bins);
                         binned.bin_edges[ctr_start..].to_vec()
+                    }
+                };
+
+                // CFE: categorical fold evidence (cross-fit tuple posteriors).
+                let cfe_edges: Vec<Vec<f64>> = {
+                    let cfe_cols =
+                        self.build_cat_fold_evidence(&x_data, &y_data, n_rows, n_features);
+                    if cfe_cols.is_empty() {
+                        Vec::new()
+                    } else {
+                        let cfe_start = binned.n_features;
+                        binned.add_ots_features(&cfe_cols, effective_bins);
+                        binned.bin_edges[cfe_start..].to_vec()
+                    }
+                };
+                // With CFE active, flatten raw HIGH-CARD categorical columns:
+                // their native subset splits are exactly the memorization the
+                // cross-fit evidence replaces, and removing them is where most
+                // of the accuracy win comes from (verified on Amazon-access).
+                if self.cfe_demote_raw && !self.cfe_tuples.is_empty() {
+                    for f in 0..n_features {
+                        // Demote by CARDINALITY, not bin count: >256-card cats
+                        // fall back to numeric binning (n_bins <= effective_bins
+                        // hides their cardinality) but are flagged via
+                        // cll_is_categorical && !is_categorical.
+                        let hash_fallback_cat = f < binned.cll_is_categorical.len()
+                            && binned.cll_is_categorical[f]
+                            && f < binned.is_categorical.len()
+                            && !binned.is_categorical[f];
+                        if f < self.cat_features.len()
+                            && self.cat_features[f]
+                            && (binned.n_bins(f) > self.cfe_demote_min_card || hash_fallback_cat)
+                        {
+                            for row in 0..n_rows {
+                                let idx = f * binned.n_rows + row;
+                                if binned.bin_indices[idx] != crate::tree::MISSING_BIN {
+                                    binned.bin_indices[idx] = 0;
+                                }
+                            }
+                            if f + 1 < binned.non_missing_offsets.len() {
+                                let (lo, hi) = (
+                                    binned.non_missing_offsets[f],
+                                    binned.non_missing_offsets[f + 1],
+                                );
+                                for v in &mut binned.non_missing_bin_values[lo..hi] {
+                                    if *v != crate::tree::MISSING_BIN {
+                                        *v = 0;
+                                    }
+                                }
+                            }
+                            // Also disable CLL lookups on the demoted column:
+                            // cll_hash_bins keep full cardinality, so leaving
+                            // cll_is_categorical set would let cat_lookup_smooth
+                            // / adaptive_leaf_experts memorize the column the
+                            // demotion just removed (and with train/predict CLL
+                            // bin spaces disagreeing after the edge flatten).
+                            if f < binned.cll_is_categorical.len() {
+                                binned.cll_is_categorical[f] = false;
+                            }
+                            binned.bin_edges[f] = vec![0.0];
+                        }
+                    }
+                }
+                // CFE stage 2: residual evidence (internal warmup -> tables
+                // over the same tuples, targets = residual gradients).
+                let cfe_resid_edges: Vec<Vec<f64>> = {
+                    let cols = self.build_cfe_residual_evidence(
+                        &binned, &x_data, &y_data, n_rows, n_features,
+                    );
+                    if cols.is_empty() {
+                        Vec::new()
+                    } else {
+                        let start = binned.n_features;
+                        binned.add_ots_features(&cols, effective_bins);
+                        binned.bin_edges[start..].to_vec()
                     }
                 };
 
@@ -1407,6 +2183,26 @@ impl GTBoostModel {
                             &ordered_ctr_edges,
                         );
                     }
+                    if !cfe_edges.is_empty() {
+                        let eval_cfe =
+                            self.cat_fold_evidence_columns_for_raw(&ex_data, en_rows, n_features);
+                        BinnedData::add_ots_features_with_edges(
+                            &mut eval_bins,
+                            en_rows,
+                            &eval_cfe,
+                            &cfe_edges,
+                        );
+                    }
+                    if !cfe_resid_edges.is_empty() {
+                        let eval_resid =
+                            self.cfe_residual_columns_for_raw(&ex_data, en_rows, n_features);
+                        BinnedData::add_ots_features_with_edges(
+                            &mut eval_bins,
+                            en_rows,
+                            &eval_resid,
+                            &cfe_resid_edges,
+                        );
+                    }
                     // Build CLL hash bins for eval data (for high-cardinality categoricals)
                     let eval_cll_hash_bins = if self.cat_lookup_smooth > 0.0 {
                         let mut cll_bins = BinnedData::build_cll_hash_bins(
@@ -1455,7 +2251,12 @@ impl GTBoostModel {
                     // (see post-eval block). We need ex_data preserved here so we can
                     // extend eval_bins with virtual columns later.
                     let eval_cll_hash_bins_mut = eval_cll_hash_bins;
-                    let eval_raw = if self.auto_interactions || self.jit_ltso_enabled {
+                    let eval_raw = if self.auto_interactions
+                        || self.jit_ltso_enabled
+                        || (self.vertical_init
+                            && self.task == "regression"
+                            && init_score_data.is_none())
+                    {
                         ex_data
                     } else {
                         Vec::new()
@@ -1491,11 +2292,13 @@ impl GTBoostModel {
                     let cat_indices: Vec<usize> = (0..n_features)
                         .filter(|&i| i < self.cat_features.len() && self.cat_features[i])
                         .collect();
-                    // LTSO is only a regression learner-family. It is admitted by
-                    // honest residual-transfer below, so low-dimensional numeric
-                    // regression can use hinge/diff/ratio operators while mixed
-                    // categorical regression can still use the N|C family.
-                    if self.task != "regression" || num_indices.is_empty() {
+                    // LTSO is a regression/binary learner-family. It is admitted
+                    // by honest residual-transfer below, so low-dimensional
+                    // numeric tasks can use hinge/diff/ratio operators while
+                    // mixed categorical tasks can still use the N|C family.
+                    if !matches!(self.task.as_str(), "regression" | "binary")
+                        || num_indices.is_empty()
+                    {
                         // Leave binned/eval data untouched.
                     } else {
                         let (residual, residual_base) = match self.task.as_str() {
@@ -1691,6 +2494,7 @@ impl GTBoostModel {
                 {
                     self.trees.clear();
                     self.tree_in_sample.clear();
+                    self.vertical_prior = VerticalPrior::default();
 
                     // Auto-compute optimal base_score from training data.
                     let y_mean = if let Some(sw) = sample_weight_data.as_deref() {
@@ -1793,6 +2597,19 @@ impl GTBoostModel {
                         _ => {}
                     }
 
+                    let native_init_score = if init_score_data.is_none() {
+                        self.fit_vertical_prior_for_regression(
+                            &x_data,
+                            &y_data,
+                            n_rows,
+                            n_features_original,
+                            sample_weight_data.as_deref(),
+                        )
+                    } else {
+                        self.vertical_prior = VerticalPrior::default();
+                        init_score_data.clone()
+                    };
+
                     let mut eval_data = eval_data;
                     if self.task == "multiclass" {
                         self.fit_multiclass(
@@ -1802,6 +2619,8 @@ impl GTBoostModel {
                             n_features,
                             n_rounds,
                             &mut eval_data,
+                            init_score_data.as_deref(),
+                            eval_init_score_data.as_deref(),
                         );
                     } else {
                         self.fit_single(
@@ -1813,7 +2632,8 @@ impl GTBoostModel {
                             &mut eval_data,
                             &x_data,
                             n_features_original,
-                            init_score_data.as_deref(),
+                            native_init_score.as_deref(),
+                            eval_init_score_data.as_deref(),
                             sample_weight_data.as_deref(),
                         );
                         self.apply_corrective_block_refit(
@@ -1822,7 +2642,10 @@ impl GTBoostModel {
                             n_rows,
                             n_features_original,
                             &y_data,
-                            init_score_data.as_deref(),
+                            native_init_score.as_deref(),
+                            eval_data
+                                .as_ref()
+                                .map(|(_, ey, en, ex, _)| (ex.as_slice(), ey.as_slice(), *en)),
                         );
                     }
                 }
@@ -1875,6 +2698,10 @@ impl GTBoostModel {
         let n_features_original = dataset.n_features_raw;
         let mut binned = dataset.binned.clone();
         binned.split_pessimism = self.split_pessimism;
+        binned.cat_prototype_bins = self.cat_prototype_bins;
+        binned.cat_audit_strength = self.cat_audit_strength;
+        binned.split_contrast_penalty = self.split_contrast_penalty;
+        binned.signal_gate = self.signal_gate;
         let x_data = dataset.x_data.clone();
         let y_data = dataset.y_data.clone();
         let mut eval_data = dataset.eval_data.clone();
@@ -1888,11 +2715,17 @@ impl GTBoostModel {
                     )
                 })?;
                 let v: Vec<f64> = arr.to_owned_array().into_raw_vec_and_offset().0;
-                if v.len() != n_rows {
+                let expected_len = if self.task == "multiclass" {
+                    let n_classes = y_data.iter().map(|&vv| vv as usize).max().unwrap_or(0) + 1;
+                    n_rows.saturating_mul(n_classes)
+                } else {
+                    n_rows
+                };
+                if v.len() != expected_len {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "init_score length ({}) must equal n_rows ({})",
+                        "init_score length ({}) must equal expected length ({})",
                         v.len(),
-                        n_rows
+                        expected_len
                     )));
                 }
                 Some(v)
@@ -1923,6 +2756,7 @@ impl GTBoostModel {
         let max_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
+        let subtrees_per_round = self.subtrees_per_boosting_round(binned.n_features);
         let tree_work_multiplier = if self.task == "multiclass" {
             let n_classes = y_data
                 .iter()
@@ -1933,12 +2767,10 @@ impl GTBoostModel {
                 + 1;
             n_rounds
                 .max(1)
-                .saturating_mul(self.n_trees_per_round.max(1))
+                .saturating_mul(subtrees_per_round)
                 .saturating_mul(n_classes.max(1))
         } else {
-            n_rounds
-                .max(1)
-                .saturating_mul(self.n_trees_per_round.max(1))
+            n_rounds.max(1).saturating_mul(subtrees_per_round)
         };
         let work_estimate = n_rows
             .saturating_mul(binned.n_features)
@@ -1960,6 +2792,18 @@ impl GTBoostModel {
                 self.n_features = n_features;
                 self.clear_trained_state_for_fit();
                 self.compute_base_scores_for_fit(&y_data, n_rows, sample_weight_data.as_deref());
+                let native_init_score = if init_score_data.is_none() {
+                    self.fit_vertical_prior_for_regression(
+                        &x_data,
+                        &y_data,
+                        n_rows,
+                        n_features_original,
+                        sample_weight_data.as_deref(),
+                    )
+                } else {
+                    self.vertical_prior = VerticalPrior::default();
+                    init_score_data.clone()
+                };
 
                 if self.task == "multiclass" {
                     self.fit_multiclass(
@@ -1969,6 +2813,8 @@ impl GTBoostModel {
                         n_features,
                         n_rounds,
                         &mut eval_data,
+                        init_score_data.as_deref(),
+                        None,
                     );
                 } else {
                     self.fit_single(
@@ -1980,7 +2826,8 @@ impl GTBoostModel {
                         &mut eval_data,
                         &x_data,
                         n_features_original,
-                        init_score_data.as_deref(),
+                        native_init_score.as_deref(),
+                        None,
                         sample_weight_data.as_deref(),
                     );
                     self.apply_corrective_block_refit(
@@ -1989,7 +2836,10 @@ impl GTBoostModel {
                         n_rows,
                         n_features_original,
                         &y_data,
-                        init_score_data.as_deref(),
+                        native_init_score.as_deref(),
+                        eval_data
+                            .as_ref()
+                            .map(|(_, ey, en, ex, _)| (ex.as_slice(), ey.as_slice(), *en)),
                     );
                 }
 
@@ -2018,7 +2868,8 @@ impl GTBoostModel {
         let x_data_raw: Vec<f64> = x_standard.into_raw_vec_and_offset().0;
 
         // Optional per-row init_score: must match what was passed to fit().
-        // Only applied on non-multiclass paths in this revision.
+        // Binary/regression expect one value per row; multiclass expects a flat
+        // row-major n_rows * n_classes margin matrix.
         let init_score_vec: Option<Vec<f64>> = match init_score {
             Some(s) => {
                 let arr: Bound<'_, PyArray1<f64>> = s.extract().map_err(|_| {
@@ -2027,11 +2878,16 @@ impl GTBoostModel {
                     )
                 })?;
                 let v: Vec<f64> = arr.to_owned_array().into_raw_vec_and_offset().0;
-                if v.len() != n_rows {
+                let expected_len = if self.task == "multiclass" {
+                    n_rows.saturating_mul(self.n_classes.max(1))
+                } else {
+                    n_rows
+                };
+                if v.len() != expected_len {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "predict: init_score length ({}) must equal n_rows ({})",
+                        "predict: init_score length ({}) must equal expected length ({})",
                         v.len(),
-                        n_rows,
+                        expected_len,
                     )));
                 }
                 Some(v)
@@ -2088,9 +2944,20 @@ impl GTBoostModel {
             } else {
                 trees.iter().map(|t| t.can_predict_binned_plain()).collect()
             };
+            let binned_plain_with_ramp_trees: Vec<bool> = if use_srp {
+                Vec::new()
+            } else {
+                trees
+                    .iter()
+                    .map(|t| t.can_predict_binned_plain_with_ramp())
+                    .collect()
+            };
             let use_eval_bins = !use_srp && n_features == binned.n_features;
+            // Row-major path is OK as long as every tree is plain *or*
+            // plain+ramp — the row-major-with-ramp variant handles the second
+            // case using the same cache-friendly bin layout.
             let use_row_major_eval_bins =
-                use_eval_bins && binned_plain_trees.iter().all(|&is_plain| is_plain);
+                use_eval_bins && binned_plain_with_ramp_trees.iter().all(|&is_ok| is_ok);
             let eval_bins_row_major = if use_row_major_eval_bins {
                 Some(BinnedData::bin_with_edges_row_major(
                     x_data,
@@ -2152,6 +3019,7 @@ impl GTBoostModel {
                 let n_classes = self.n_classes;
                 let ntp = self.multiclass_trees_per_class_round();
                 let use_prob_avg = self.prob_avg && ntp > 1;
+                let init_score_ref = init_score_vec.as_deref();
                 let preds_2d: Vec<Vec<f64>> = (0..n_rows)
                     .into_par_iter()
                     .map(|row| {
@@ -2163,7 +3031,15 @@ impl GTBoostModel {
                             for (t_idx, tree) in trees.iter().enumerate() {
                                 let k = (t_idx / ntp) % n_classes;
                                 let c = if let Some(ref row_bins) = eval_bins_row_major {
-                                    tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_row_major(
+                                            row_bins, n_features, row,
+                                        )
+                                    } else {
+                                        tree.predict_binned_plain_row_major_with_ramp(
+                                            row_bins, n_features, row,
+                                        )
+                                    }
                                 } else if let Some(ref bins) = eval_bins {
                                     if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
                                         tree.predict_binned_plain_raw(bins, n_rows, row)
@@ -2208,7 +3084,10 @@ impl GTBoostModel {
                         } else {
                             // Standard: return raw margins. Python/sklearn wrappers own
                             // probability conversion, avoiding double-softmax underconfidence.
-                            let mut scores = if self.class_base_scores.len() == n_classes {
+                            let mut scores = if let Some(init) = init_score_ref {
+                                let base = row * n_classes;
+                                init[base..base + n_classes].to_vec()
+                            } else if self.class_base_scores.len() == n_classes {
                                 self.class_base_scores.clone()
                             } else {
                                 vec![0.0f64; n_classes]
@@ -2220,7 +3099,15 @@ impl GTBoostModel {
                                     1.0
                                 };
                                 let c = if let Some(ref row_bins) = eval_bins_row_major {
-                                    tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_row_major(
+                                            row_bins, n_features, row,
+                                        )
+                                    } else {
+                                        tree.predict_binned_plain_row_major_with_ramp(
+                                            row_bins, n_features, row,
+                                        )
+                                    }
                                 } else if let Some(ref bins) = eval_bins {
                                     if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
                                         tree.predict_binned_plain_raw(bins, n_rows, row)
@@ -2252,6 +3139,8 @@ impl GTBoostModel {
             } else {
                 let base = self.base_score;
                 let init_score_ref = init_score_vec.as_deref();
+                let vertical_prior = &self.vertical_prior;
+                let use_vertical_prior = vertical_prior.is_active() && init_score_ref.is_none();
                 let is_poisson = self.task == "poisson";
                 let cat_offset_maps = &self.cat_offset_maps;
                 let has_cat_offsets = self.task == "binary" && !cat_offset_maps.is_empty();
@@ -2259,10 +3148,12 @@ impl GTBoostModel {
                     .into_par_iter()
                     .map(|row| {
                         let row_data = &x_data[row * n_features..(row + 1) * n_features];
+                        let raw_row = &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
                         // Per-row offset: init_score if user supplied one, else
-                        // the global base_score (legacy behavior).
+                        // fitted vertical prior if present, else the global base_score.
                         let mut sum = match init_score_ref {
                             Some(s) => s[row],
+                            None if use_vertical_prior => vertical_prior.predict_row(raw_row),
                             None => base,
                         };
                         for (t_idx, tree) in trees.iter().enumerate() {
@@ -2272,7 +3163,13 @@ impl GTBoostModel {
                                 1.0
                             };
                             let c = if let Some(ref row_bins) = eval_bins_row_major {
-                                tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                                if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                    tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                                } else {
+                                    tree.predict_binned_plain_row_major_with_ramp(
+                                        row_bins, n_features, row,
+                                    )
+                                }
                             } else if let Some(ref bins) = eval_bins {
                                 if tree.has_self_score_splits() {
                                     tree.predict_binned_raw_with_score(
@@ -2299,8 +3196,6 @@ impl GTBoostModel {
                             sum += lr * w * c;
                         }
                         if has_cat_offsets {
-                            let raw_row =
-                                &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
                             for (feat, map) in cat_offset_maps.iter().enumerate() {
                                 if map.is_empty() || feat >= n_features_raw {
                                     continue;
@@ -2417,11 +3312,18 @@ impl GTBoostModel {
                 preds_2d.into_iter().flatten().collect()
             } else {
                 let base = self.base_score;
+                let vertical_prior = &self.vertical_prior;
+                let use_vertical_prior = vertical_prior.is_active();
                 (0..n_rows)
                     .into_par_iter()
                     .map(|row| {
                         let row_data = &x_data[row * n_features..(row + 1) * n_features];
-                        let mut sum = base;
+                        let raw_row = &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
+                        let mut sum = if use_vertical_prior {
+                            vertical_prior.predict_row(raw_row)
+                        } else {
+                            base
+                        };
                         for tree in trees.iter() {
                             let c = if tree.has_self_score_splits() {
                                 tree.predict_raw_row_with_score(binned, row_data, sum)
@@ -2532,11 +3434,18 @@ impl GTBoostModel {
                 preds_2d.into_iter().flatten().collect()
             } else {
                 let base = self.base_score;
+                let vertical_prior = &self.vertical_prior;
+                let use_vertical_prior = vertical_prior.is_active();
                 (0..n_rows)
                     .into_par_iter()
                     .map(|row| {
                         let row_data = &x_data[row * n_features..(row + 1) * n_features];
-                        let mut sum = base;
+                        let raw_row = &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
+                        let mut sum = if use_vertical_prior {
+                            vertical_prior.predict_row(raw_row)
+                        } else {
+                            base
+                        };
                         for (t_idx, tree) in trees.iter().enumerate() {
                             if t_idx < mask.len() && mask[t_idx] == 0 {
                                 continue;
@@ -2558,6 +3467,37 @@ impl GTBoostModel {
 
     pub fn tree_info(&self) -> Vec<(usize, usize)> {
         self.trees.iter().map(|t| t.node_counts()).collect()
+    }
+
+    /// Return per-tree weights. Empty means every tree has weight 1.0.
+    pub fn tree_weights(&self) -> Vec<f64> {
+        self.dart_tree_weights.clone()
+    }
+
+    /// Set per-tree weights used by predict() and predict_truncated().
+    ///
+    /// This is intentionally post-fit only: Python-side validation routines can
+    /// compile a guarded path ensemble back into the native single-pass model
+    /// without changing the tree structure.
+    pub fn set_tree_weights(&mut self, weights: Vec<f64>) -> PyResult<()> {
+        if weights.is_empty() {
+            self.dart_tree_weights.clear();
+            return Ok(());
+        }
+        if weights.len() != self.trees.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "tree weight length ({}) must equal number of trees ({})",
+                weights.len(),
+                self.trees.len()
+            )));
+        }
+        if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "tree weights must be finite and non-negative",
+            ));
+        }
+        self.dart_tree_weights = weights;
+        Ok(())
     }
 
     pub fn task_name(&self) -> String {
@@ -2685,6 +3625,50 @@ impl GTBoostModel {
     /// Per-sample leaf IDs for each tree. Returns flat Vec of length n_rows * n_trees
     /// (row-major). Enables "lazy" leaf-fingerprint KNN at predict time (Friedman-Kohavi-Yun
     /// AAAI 1996 style lazy trees adapted to GBM).
+    /// Refine 3.1 deployment hook: add per-leaf corrections IN PLACE, so the
+    /// refined model is a single native artifact (native predict, nothing
+    /// Python-side at inference). Entries are (tree_idx, node_idx, delta)
+    /// triplets; node_idx must be a leaf. Works for regression, binary, and
+    /// multiclass (per-class trees are ordinary single-output trees laid out
+    /// round-major, class-minor — tree t serves class t % n_classes).
+    pub fn add_leaf_corrections(
+        &mut self,
+        tree_idx: Vec<u32>,
+        node_idx: Vec<u32>,
+        delta: Vec<f64>,
+    ) -> PyResult<()> {
+        if tree_idx.len() != node_idx.len() || node_idx.len() != delta.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "tree_idx, node_idx and delta must have equal lengths",
+            ));
+        }
+        let n_trees = self.trees.len();
+        for ((&t, &nd), &d) in tree_idx.iter().zip(node_idx.iter()).zip(delta.iter()) {
+            let t = t as usize;
+            let nd = nd as usize;
+            let tree = self.trees.get_mut(t).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "tree_idx {} out of range ({} trees)",
+                    t, n_trees
+                ))
+            })?;
+            if nd >= tree.values.len() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "node_idx {} out of range for tree {}",
+                    nd, t
+                )));
+            }
+            if tree.split_features.get(nd).copied().unwrap_or(u32::MAX) != u32::MAX {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "node {} of tree {} is not a leaf",
+                    nd, t
+                )));
+            }
+            tree.values[nd] += d;
+        }
+        Ok(())
+    }
+
     pub fn leaf_indices(&self, py: Python<'_>, x: Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
         let x_array: Bound<'_, PyArray2<f64>> = x.extract()?;
         let n_rows = x_array.shape()[0];
@@ -2732,11 +3716,13 @@ impl GTBoostModel {
     /// For multiclass, n_trees should be a multiple of
     /// n_classes * multiclass_trees_per_class_round().
     /// Returns raw logits for binary/multiclass, raw values for regression.
+    #[pyo3(signature = (x, n_trees, init_score = None))]
     pub fn predict_truncated(
         &self,
         py: Python<'_>,
         x: Bound<'_, PyAny>,
         n_trees: usize,
+        init_score: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Vec<f64>> {
         let x_array: Bound<'_, PyArray2<f64>> = x.extract()?;
         let n_rows = x_array.shape()[0];
@@ -2748,6 +3734,31 @@ impl GTBoostModel {
             x_owned.as_standard_layout().into_owned()
         };
         let x_data_raw: Vec<f64> = x_standard.into_raw_vec_and_offset().0;
+
+        let init_score_vec: Option<Vec<f64>> = match init_score {
+            Some(s) => {
+                let arr: Bound<'_, PyArray1<f64>> = s.extract().map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "predict_truncated: init_score must be a 1-D float64 numpy array",
+                    )
+                })?;
+                let v: Vec<f64> = arr.to_owned_array().into_raw_vec_and_offset().0;
+                let expected_len = if self.task == "multiclass" {
+                    n_rows.saturating_mul(self.n_classes.max(1))
+                } else {
+                    n_rows
+                };
+                if v.len() != expected_len {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "predict_truncated: init_score length ({}) must equal expected length ({})",
+                        v.len(),
+                        expected_len,
+                    )));
+                }
+                Some(v)
+            }
+            None => None,
+        };
 
         let binned = match &self.binned {
             Some(b) => b,
@@ -2772,11 +3783,55 @@ impl GTBoostModel {
             let trees = &self.trees[..n_use];
             let dart_w = &self.dart_tree_weights;
             let has_dart_w = !dart_w.is_empty();
+            let binned_plain_trees: Vec<bool> =
+                trees.iter().map(|t| t.can_predict_binned_plain()).collect();
+            let binned_plain_with_ramp_trees: Vec<bool> = trees
+                .iter()
+                .map(|t| t.can_predict_binned_plain_with_ramp())
+                .collect();
+            let use_eval_bins = n_features == binned.n_features;
+            let use_row_major_eval_bins =
+                use_eval_bins && binned_plain_with_ramp_trees.iter().all(|&is_ok| is_ok);
+            let eval_bins_row_major = if use_row_major_eval_bins {
+                Some(BinnedData::bin_with_edges_row_major(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &binned.bin_edges,
+                    &binned.is_categorical,
+                ))
+            } else {
+                None
+            };
+            let eval_bins = if use_eval_bins && !use_row_major_eval_bins {
+                Some(BinnedData::bin_with_edges(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &binned.bin_edges,
+                    &binned.is_categorical,
+                ))
+            } else {
+                None
+            };
+            let eval_cll_hash_bins = if eval_bins.is_some() && self.cat_lookup_smooth > 0.0 {
+                BinnedData::build_cll_hash_bins(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &self.cat_features,
+                    &binned.is_categorical,
+                    &binned.bin_edges,
+                )
+            } else {
+                Vec::new()
+            };
 
             if self.task == "multiclass" {
                 let n_classes = self.n_classes;
                 let ntp = self.multiclass_trees_per_class_round();
                 let use_prob_avg = self.prob_avg && ntp > 1;
+                let init_score_ref = init_score_vec.as_deref();
                 let preds_2d: Vec<Vec<f64>> = (0..n_rows)
                     .into_par_iter()
                     .map(|row| {
@@ -2785,7 +3840,31 @@ impl GTBoostModel {
                             let mut avg_probs = vec![0.0f64; n_classes];
                             for (t_idx, tree) in trees.iter().enumerate() {
                                 let k = (t_idx / ntp) % n_classes;
-                                avg_probs[k] += tree.predict_raw_row(binned, row_data);
+                                let c = if let Some(ref row_bins) = eval_bins_row_major {
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_row_major(
+                                            row_bins, n_features, row,
+                                        )
+                                    } else {
+                                        tree.predict_binned_plain_row_major_with_ramp(
+                                            row_bins, n_features, row,
+                                        )
+                                    }
+                                } else if let Some(ref bins) = eval_bins {
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_raw(bins, n_rows, row)
+                                    } else {
+                                        tree.predict_binned_raw(
+                                            bins,
+                                            n_rows,
+                                            row,
+                                            &eval_cll_hash_bins,
+                                        )
+                                    }
+                                } else {
+                                    tree.predict_raw_row(binned, row_data)
+                                };
+                                avg_probs[k] += c;
                             }
                             let inv_ntp = 1.0 / ntp as f64;
                             for p in avg_probs.iter_mut() {
@@ -2804,7 +3883,10 @@ impl GTBoostModel {
                             }
                             avg_probs
                         } else {
-                            let mut scores = if self.class_base_scores.len() == n_classes {
+                            let mut scores = if let Some(init) = init_score_ref {
+                                let base = row * n_classes;
+                                init[base..base + n_classes].to_vec()
+                            } else if self.class_base_scores.len() == n_classes {
                                 self.class_base_scores.clone()
                             } else {
                                 vec![0.0f64; n_classes]
@@ -2815,8 +3897,31 @@ impl GTBoostModel {
                                 } else {
                                     1.0
                                 };
-                                scores[(t_idx / ntp) % n_classes] +=
-                                    lr * w * tree.predict_raw_row(binned, row_data);
+                                let c = if let Some(ref row_bins) = eval_bins_row_major {
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_row_major(
+                                            row_bins, n_features, row,
+                                        )
+                                    } else {
+                                        tree.predict_binned_plain_row_major_with_ramp(
+                                            row_bins, n_features, row,
+                                        )
+                                    }
+                                } else if let Some(ref bins) = eval_bins {
+                                    if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                        tree.predict_binned_plain_raw(bins, n_rows, row)
+                                    } else {
+                                        tree.predict_binned_raw(
+                                            bins,
+                                            n_rows,
+                                            row,
+                                            &eval_cll_hash_bins,
+                                        )
+                                    }
+                                } else {
+                                    tree.predict_raw_row(binned, row_data)
+                                };
+                                scores[(t_idx / ntp) % n_classes] += lr * w * c;
                             }
                             scores
                         }
@@ -2825,19 +3930,49 @@ impl GTBoostModel {
                 preds_2d.into_iter().flatten().collect()
             } else {
                 let base = self.base_score;
+                let init_score_ref = init_score_vec.as_deref();
+                let vertical_prior = &self.vertical_prior;
+                let use_vertical_prior = vertical_prior.is_active() && init_score_ref.is_none();
                 let is_poisson = self.task == "poisson";
                 (0..n_rows)
                     .into_par_iter()
                     .map(|row| {
                         let row_data = &x_data[row * n_features..(row + 1) * n_features];
-                        let mut sum = base;
+                        let raw_row = &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
+                        let mut sum = match init_score_ref {
+                            Some(s) => s[row],
+                            None if use_vertical_prior => vertical_prior.predict_row(raw_row),
+                            None => base,
+                        };
                         for (t_idx, tree) in trees.iter().enumerate() {
                             let w = if has_dart_w && t_idx < dart_w.len() {
                                 dart_w[t_idx]
                             } else {
                                 1.0
                             };
-                            let c = if tree.has_self_score_splits() {
+                            let c = if let Some(ref row_bins) = eval_bins_row_major {
+                                if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                    tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                                } else {
+                                    tree.predict_binned_plain_row_major_with_ramp(
+                                        row_bins, n_features, row,
+                                    )
+                                }
+                            } else if let Some(ref bins) = eval_bins {
+                                if tree.has_self_score_splits() {
+                                    tree.predict_binned_raw_with_score(
+                                        bins,
+                                        n_rows,
+                                        row,
+                                        &eval_cll_hash_bins,
+                                        sum,
+                                    )
+                                } else if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                    tree.predict_binned_plain_raw(bins, n_rows, row)
+                                } else {
+                                    tree.predict_binned_raw(bins, n_rows, row, &eval_cll_hash_bins)
+                                }
+                            } else if tree.has_self_score_splits() {
                                 tree.predict_raw_row_with_score(binned, row_data, sum)
                             } else {
                                 tree.predict_raw_row(binned, row_data)
@@ -2856,4 +3991,225 @@ impl GTBoostModel {
 
         Ok(result)
     }
+
+    /// Cheap tree count (avoids marshaling full tree_info per predict call).
+    pub fn n_trees(&self) -> usize {
+        self.trees.len()
+    }
+
+    /// Per-feature split usage counts across all trees (consensus-guided boosting:
+    /// fold-model usage maps distill which structural choices replicate across
+    /// resampled worlds; the real fit consumes them as feature_gain_prior).
+    pub fn feature_split_counts(&self) -> Vec<f64> {
+        let mut counts = vec![0.0f64; self.n_features.max(1)];
+        for tree in &self.trees {
+            for node in 0..tree.split_features.len() {
+                let f = tree.split_features[node];
+                if f == u32::MAX {
+                    continue;
+                }
+                if tree.is_oblique_split.get(node).copied().unwrap_or(false) {
+                    for j in 0..2 {
+                        let of = tree.oblique_features.get(node * 2 + j).copied().unwrap_or(u32::MAX);
+                        if of != u32::MAX && (of as usize) < counts.len() {
+                            counts[of as usize] += 1.0;
+                        }
+                    }
+                } else if (f as usize) < counts.len() {
+                    counts[f as usize] += 1.0;
+                }
+            }
+        }
+        counts
+    }
+
+    /// All-checkpoints prediction in ONE pass: bins the matrix once and walks
+    /// each row's trees once, snapshotting the margin at every checkpoint.
+    /// Replaces N separate `predict_truncated` calls (each of which re-extends,
+    /// re-bins and re-traverses) on the APX predict path. Non-multiclass only.
+    /// Returns a flat vector of length n_checkpoints * n_rows, checkpoint-major.
+    #[pyo3(signature = (x, checkpoints, init_score = None))]
+    pub fn predict_checkpoints(
+        &self,
+        py: Python<'_>,
+        x: Bound<'_, PyAny>,
+        checkpoints: Vec<usize>,
+        init_score: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<f64>> {
+        if self.task == "multiclass" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "predict_checkpoints: multiclass not supported (use predict_truncated)",
+            ));
+        }
+        if checkpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let x_array: Bound<'_, PyArray2<f64>> = x.extract()?;
+        let n_rows = x_array.shape()[0];
+        let n_features_raw = x_array.shape()[1];
+        let x_owned = x_array.to_owned_array();
+        let x_standard = if x_owned.is_standard_layout() {
+            x_owned
+        } else {
+            x_owned.as_standard_layout().into_owned()
+        };
+        let x_data_raw: Vec<f64> = x_standard.into_raw_vec_and_offset().0;
+        let init_score_vec: Option<Vec<f64>> = match init_score {
+            Some(s) => {
+                let arr: Bound<'_, PyArray1<f64>> = s.extract().map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "predict_checkpoints: init_score must be a 1-D float64 numpy array",
+                    )
+                })?;
+                Some(arr.to_owned_array().into_raw_vec_and_offset().0)
+            }
+            None => None,
+        };
+        let binned = match &self.binned {
+            Some(b) => b,
+            None => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Model not trained yet. Call fit() first.",
+                ))
+            }
+        };
+        let (x_data, n_features) = self.extend_raw_matrix(&x_data_raw, n_rows, n_features_raw);
+        let n_trees_total = self.trees.len();
+        let cps: Vec<usize> = checkpoints
+            .iter()
+            .map(|&c| c.min(n_trees_total))
+            .collect();
+        let n_use = cps.iter().copied().max().unwrap_or(0);
+        let n_cps = cps.len();
+
+        let result = py.detach(|| {
+            let lr = self.learning_rate;
+            let trees = &self.trees[..n_use];
+            let dart_w = &self.dart_tree_weights;
+            let has_dart_w = !dart_w.is_empty();
+            let binned_plain_trees: Vec<bool> =
+                trees.iter().map(|t| t.can_predict_binned_plain()).collect();
+            let binned_plain_with_ramp_trees: Vec<bool> = trees
+                .iter()
+                .map(|t| t.can_predict_binned_plain_with_ramp())
+                .collect();
+            let use_eval_bins = n_features == binned.n_features;
+            let use_row_major_eval_bins =
+                use_eval_bins && binned_plain_with_ramp_trees.iter().all(|&is_ok| is_ok);
+            let eval_bins_row_major = if use_row_major_eval_bins {
+                Some(BinnedData::bin_with_edges_row_major(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &binned.bin_edges,
+                    &binned.is_categorical,
+                ))
+            } else {
+                None
+            };
+            let eval_bins = if use_eval_bins && !use_row_major_eval_bins {
+                Some(BinnedData::bin_with_edges(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &binned.bin_edges,
+                    &binned.is_categorical,
+                ))
+            } else {
+                None
+            };
+            let eval_cll_hash_bins = if eval_bins.is_some() && self.cat_lookup_smooth > 0.0 {
+                BinnedData::build_cll_hash_bins(
+                    &x_data,
+                    n_rows,
+                    n_features,
+                    &self.cat_features,
+                    &binned.is_categorical,
+                    &binned.bin_edges,
+                )
+            } else {
+                Vec::new()
+            };
+
+            let base = self.base_score;
+            let init_score_ref = init_score_vec.as_deref();
+            let vertical_prior = &self.vertical_prior;
+            let use_vertical_prior = vertical_prior.is_active() && init_score_ref.is_none();
+            let is_poisson = self.task == "poisson";
+            let per_row: Vec<Vec<f64>> = (0..n_rows)
+                .into_par_iter()
+                .map(|row| {
+                    let row_data = &x_data[row * n_features..(row + 1) * n_features];
+                    let raw_row =
+                        &x_data_raw[row * n_features_raw..(row + 1) * n_features_raw];
+                    let mut sum = match init_score_ref {
+                        Some(s) => s[row],
+                        None if use_vertical_prior => vertical_prior.predict_row(raw_row),
+                        None => base,
+                    };
+                    let mut snaps = vec![0.0f64; n_cps];
+                    let snap = |s: f64| if is_poisson { s.exp() } else { s };
+                    for (ci, &cp) in cps.iter().enumerate() {
+                        if cp == 0 {
+                            snaps[ci] = snap(sum);
+                        }
+                    }
+                    for (t_idx, tree) in trees.iter().enumerate() {
+                        let w = if has_dart_w && t_idx < dart_w.len() {
+                            dart_w[t_idx]
+                        } else {
+                            1.0
+                        };
+                        let c = if let Some(ref row_bins) = eval_bins_row_major {
+                            if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                tree.predict_binned_plain_row_major(row_bins, n_features, row)
+                            } else {
+                                tree.predict_binned_plain_row_major_with_ramp(
+                                    row_bins, n_features, row,
+                                )
+                            }
+                        } else if let Some(ref bins) = eval_bins {
+                            if tree.has_self_score_splits() {
+                                tree.predict_binned_raw_with_score(
+                                    bins,
+                                    n_rows,
+                                    row,
+                                    &eval_cll_hash_bins,
+                                    sum,
+                                )
+                            } else if binned_plain_trees.get(t_idx).copied().unwrap_or(false) {
+                                tree.predict_binned_plain_raw(bins, n_rows, row)
+                            } else {
+                                tree.predict_binned_raw(bins, n_rows, row, &eval_cll_hash_bins)
+                            }
+                        } else if tree.has_self_score_splits() {
+                            tree.predict_raw_row_with_score(binned, row_data, sum)
+                        } else {
+                            tree.predict_raw_row(binned, row_data)
+                        };
+                        sum += lr * w * c;
+                        for (ci, &cp) in cps.iter().enumerate() {
+                            if cp == t_idx + 1 {
+                                snaps[ci] = snap(sum);
+                            }
+                        }
+                    }
+                    snaps
+                })
+                .collect();
+            let mut out = vec![0.0f64; n_cps * n_rows];
+            for (row, snaps) in per_row.into_iter().enumerate() {
+                for (ci, v) in snaps.into_iter().enumerate() {
+                    out[ci * n_rows + row] = v;
+                }
+            }
+            out
+        });
+        Ok(result)
+    }
+}
+
+
+fn serde_true() -> bool {
+    true
 }

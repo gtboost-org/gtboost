@@ -129,6 +129,109 @@ impl DecisionTree {
         }
     }
 
+    /// Variance-aware leaf shrinkage (a t-statistic on the Newton step). The leaf
+    /// value -G/(H+λ) ignores how NOISY the leaf's gradients are. Here each leaf is
+    /// scaled by its gradient reliability r = mean² / (mean² + var/n): a leaf whose
+    /// gradients agree (low variance) keeps its value (r→1); a leaf whose gradients
+    /// are inconsistent (high variance relative to their mean — likely a spurious
+    /// small-data split) is shrunk toward zero (r→0). `strength` is the exponent on
+    /// r. One extra Σg² pass over the rows; structure untouched. Universal, fast,
+    /// and aimed at the few-% small-data leaf overfit that plain λ/count miss.
+    pub fn shrink_leaves_by_gradient_reliability(
+        &mut self,
+        binned: &BinnedData,
+        gradients: &[f64],
+        row_indices: &[u32],
+        strength: f64,
+    ) {
+        if strength <= 0.0 {
+            return;
+        }
+        let n_nodes = self.split_features.len();
+        let mut lg = vec![0.0f64; n_nodes];
+        let mut lg2 = vec![0.0f64; n_nodes];
+        let mut ln = vec![0.0f64; n_nodes];
+        for &idx in row_indices {
+            let leaf = self.route_to_leaf(binned, idx as usize);
+            let g = gradients[idx as usize];
+            lg[leaf] += g;
+            lg2[leaf] += g * g;
+            ln[leaf] += 1.0;
+        }
+        for i in 0..n_nodes {
+            if self.split_features[i] == u32::MAX && ln[i] >= 2.0 {
+                let n = ln[i];
+                let mean = lg[i] / n;
+                let var = (lg2[i] / n - mean * mean).max(0.0);
+                let denom = mean * mean + var / n;
+                let rel = if denom > 1e-30 {
+                    (mean * mean / denom).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                self.values[i] *= rel.powf(strength);
+            }
+        }
+    }
+
+    /// Refit constant leaf values under SOFT routing, so the leaves are optimal
+    /// for the smooth prediction `f(x) = Σ_leaf p_leaf(x)·v_leaf` rather than for
+    /// hard routing. Each row contributes its (gradient, hessian) to every leaf it
+    /// reaches, weighted by the soft path probability `p`. The Newton/L1 leaf value
+    /// then solves the soft-weighted system, removing the train/test mismatch that
+    /// makes predict-time-only soft routing hurt. Prediction stays a convex blend
+    /// of leaf constants, so it is bounded and cannot blow up the way locally
+    /// linear leaves do. Operates on `raw_data` (row-major, `n_features` wide).
+    pub fn refit_leaves_soft(
+        &mut self,
+        binned: &BinnedData,
+        raw_data: &[f64],
+        n_features: usize,
+        gradients: &[f64],
+        hessians: &[f64],
+        row_indices: &[u32],
+        lambda_reg: f64,
+        l1_reg: f64,
+        bandwidth: f64,
+        feat_scales: &[f64],
+    ) {
+        if bandwidth <= 0.0 || n_features == 0 {
+            return;
+        }
+        let n_nodes = self.split_features.len();
+        let mut leaf_g = vec![0.0f64; n_nodes];
+        let mut leaf_h = vec![0.0f64; n_nodes];
+        let mut leaf_w = vec![0.0f64; n_nodes];
+        let mut assign: Vec<(usize, f64)> = Vec::with_capacity(16);
+        for &idx in row_indices {
+            let i = idx as usize;
+            let start = i * n_features;
+            if start + n_features > raw_data.len() {
+                continue;
+            }
+            let raw_row = &raw_data[start..start + n_features];
+            assign.clear();
+            self.soft_collect_leaves(binned, raw_row, bandwidth, feat_scales, &mut assign);
+            let g = gradients[i];
+            let h = hessians[i];
+            for &(leaf, p) in assign.iter() {
+                leaf_g[leaf] += p * g;
+                leaf_h[leaf] += p * h;
+                leaf_w[leaf] += p;
+            }
+        }
+        const MIN_SAMPLES: f64 = 10.0;
+        for i in 0..n_nodes {
+            if self.split_features[i] == u32::MAX && leaf_h[i] > 0.0 {
+                let count = leaf_w[i].max(1e-9);
+                let lambda_eff = lambda_reg * (MIN_SAMPLES / count).max(1.0);
+                self.values[i] = l1_leaf_value(leaf_g[i], leaf_h[i], lambda_eff, l1_reg);
+                self.node_h_sum[i] = leaf_h[i];
+                self.node_count[i] = count.round().max(0.0) as u32;
+            }
+        }
+    }
+
     /// Refit leaves with Huber-style gradient trimming for robust leaf values.
     /// Trims top and bottom trim_pct fraction of gradients per leaf before Newton step.
     /// Keeps gradient SCALE unchanged at training time (so ES behavior is preserved) —
@@ -521,9 +624,33 @@ impl DecisionTree {
                     }
                 }
                 let scale = (1.4826 * mad).max(MAD_EPS);
-                let z = (mean - median).abs() / scale;
+                let z = if blend_kappa < 0.0 {
+                    // Parameter-free auto mode: compare the mean/median gap to
+                    // its normal-theory standard error. Clean leaves stay near
+                    // Newton; asymmetric/outlier-heavy leaves move toward the
+                    // median without a dataset-tuned cutoff.
+                    let n_eff = (h_sum * h_sum
+                        / responses
+                            .iter()
+                            .map(|&(_, h)| h * h)
+                            .sum::<f64>()
+                            .max(1e-12))
+                    .max(1.0);
+                    const MEDIAN_SE_OVER_SIGMA: f64 = 1.2533141373155001;
+                    let se = scale
+                        * ((1.0 + MEDIAN_SE_OVER_SIGMA * MEDIAN_SE_OVER_SIGMA) / n_eff)
+                            .sqrt()
+                            .max(MAD_EPS);
+                    (mean - median).abs() / se
+                } else {
+                    (mean - median).abs() / scale
+                };
                 let z2 = z * z;
-                let k2 = blend_kappa * blend_kappa;
+                let k2 = if blend_kappa < 0.0 {
+                    1.0
+                } else {
+                    blend_kappa * blend_kappa
+                };
                 let blend = z2 / (z2 + k2);
                 blend * median + (1.0 - blend) * mean
             };
@@ -584,7 +711,7 @@ impl DecisionTree {
                 tau,
                 blend,
             );
-        } else if adaptive_blend_kappa > 0.0 {
+        } else if adaptive_blend_kappa != 0.0 {
             self.refit_leaves_adaptive_blend(
                 binned,
                 gradients,
@@ -697,6 +824,9 @@ impl DecisionTree {
         {
             return 0.0;
         }
+        if n_rows == 0 || row >= n_rows {
+            return 0.0;
+        }
         let mut sum = 0.0f64;
         if !self.ramp_slopes.is_empty() {
             let k = self.ramp_k;
@@ -707,7 +837,10 @@ impl DecisionTree {
                     if feat == u32::MAX {
                         continue;
                     }
-                    let bin = bin_indices[feat as usize * n_rows + row];
+                    let off = feat as usize * n_rows + row;
+                    let Some(&bin) = bin_indices.get(off) else {
+                        continue;
+                    };
                     if bin == MISSING_BIN {
                         continue;
                     }
@@ -721,8 +854,12 @@ impl DecisionTree {
                 let f0 = self.leaf_pair_features[base];
                 let f1 = self.leaf_pair_features[base + 1];
                 if f0 != u32::MAX && f1 != u32::MAX {
-                    let b0 = bin_indices[f0 as usize * n_rows + row];
-                    let b1 = bin_indices[f1 as usize * n_rows + row];
+                    let Some(&b0) = bin_indices.get(f0 as usize * n_rows + row) else {
+                        return sum;
+                    };
+                    let Some(&b1) = bin_indices.get(f1 as usize * n_rows + row) else {
+                        return sum;
+                    };
                     if b0 != MISSING_BIN && b1 != MISSING_BIN {
                         sum += self.leaf_pair_slopes[node] * b0 as f64 * b1 as f64;
                     }
@@ -736,8 +873,97 @@ impl DecisionTree {
             if qbase + ni <= self.quad_slopes.len() {
                 for j in 0..ni {
                     let (fi, fj) = self.quad_pairs[j];
-                    let bi = bin_indices[fi * n_rows + row];
-                    let bj = bin_indices[fj * n_rows + row];
+                    let Some(&bi) = bin_indices.get(fi * n_rows + row) else {
+                        continue;
+                    };
+                    let Some(&bj) = bin_indices.get(fj * n_rows + row) else {
+                        continue;
+                    };
+                    if bi == MISSING_BIN || bj == MISSING_BIN {
+                        continue;
+                    }
+                    sum += self.quad_slopes[qbase + j] * bi as f64 * bj as f64;
+                }
+            }
+        }
+        sum
+    }
+
+    /// Row-major variant of [`ramp_predict`]. Reads bins from a row-major
+    /// `bin_indices` buffer (`row * n_features + feat`) so all features for a
+    /// given row live in one cache line — much friendlier than the strided
+    /// column-major access pattern at predict time.
+    #[inline]
+    pub fn ramp_predict_row_major(
+        &self,
+        node: usize,
+        bin_indices: &[u16],
+        n_features: usize,
+        row: usize,
+    ) -> f64 {
+        if self.ramp_slopes.is_empty()
+            && self.leaf_pair_slopes.is_empty()
+            && self.quad_slopes.is_empty()
+        {
+            return 0.0;
+        }
+        if n_features == 0 {
+            return 0.0;
+        }
+        let row_off = row * n_features;
+        if row_off >= bin_indices.len() {
+            return 0.0;
+        }
+        let mut sum = 0.0f64;
+        if !self.ramp_slopes.is_empty() {
+            let k = self.ramp_k;
+            let base = node * k;
+            if base + k <= self.ramp_features.len() {
+                for j in 0..k {
+                    let feat = self.ramp_features[base + j];
+                    if feat == u32::MAX {
+                        continue;
+                    }
+                    let Some(&bin) = bin_indices.get(row_off + feat as usize) else {
+                        continue;
+                    };
+                    if bin == MISSING_BIN {
+                        continue;
+                    }
+                    sum += self.ramp_slopes[base + j] * bin as f64;
+                }
+            }
+        }
+        if !self.leaf_pair_slopes.is_empty() {
+            let base = node * 2;
+            if base + 1 < self.leaf_pair_features.len() && node < self.leaf_pair_slopes.len() {
+                let f0 = self.leaf_pair_features[base];
+                let f1 = self.leaf_pair_features[base + 1];
+                if f0 != u32::MAX && f1 != u32::MAX {
+                    let Some(&b0) = bin_indices.get(row_off + f0 as usize) else {
+                        return sum;
+                    };
+                    let Some(&b1) = bin_indices.get(row_off + f1 as usize) else {
+                        return sum;
+                    };
+                    if b0 != MISSING_BIN && b1 != MISSING_BIN {
+                        sum += self.leaf_pair_slopes[node] * b0 as f64 * b1 as f64;
+                    }
+                }
+            }
+        }
+        if !self.quad_slopes.is_empty() && self.quad_n_interactions > 0 {
+            let ni = self.quad_n_interactions;
+            let qbase = node * ni;
+            if qbase + ni <= self.quad_slopes.len() {
+                for j in 0..ni {
+                    let (fi, fj) = self.quad_pairs[j];
+                    let Some(&bi) = bin_indices.get(row_off + fi) else {
+                        continue;
+                    };
+                    let Some(&bj) = bin_indices.get(row_off + fj) else {
+                        continue;
+                    };
                     if bi == MISSING_BIN || bj == MISSING_BIN {
                         continue;
                     }
@@ -1519,14 +1745,19 @@ impl DecisionTree {
             return;
         }
         let count = self.node_count.get(node).copied().unwrap_or(0) as f64;
+        let h_sum = self.node_h_sum.get(node).copied().unwrap_or(0.0).max(0.0);
+        let old_value = self.values[node];
         let local_scale = if node == 0 {
             1.0
         } else if count > 0.0 {
-            count / (count + count_tau)
+            let delta = old_value - parent_value;
+            let evidence = h_sum.max(0.25 * count);
+            let signal = (evidence * delta * delta).sqrt().clamp(0.0, 12.0);
+            let effective_tau = count_tau / (1.0 + signal);
+            count / (count + effective_tau)
         } else {
             0.0
         };
-        let old_value = self.values[node];
         let new_value = if node == 0 {
             old_value
         } else {

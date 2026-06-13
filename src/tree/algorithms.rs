@@ -280,13 +280,185 @@ impl TreeBuilder {
 
 #[inline]
 pub(super) fn sum_gh(gradients: &[f64], hessians: &[f64], indices: &[u32]) -> (f64, f64) {
-    let mut g = 0.0f64;
-    let mut h = 0.0f64;
-    for &idx in indices {
+    // 4-way unrolled with independent accumulators so the CPU can pipeline
+    // four parallel f64 adds per iteration. Final reduction preserves the
+    // original total within f64 rounding.
+    let mut g0 = 0.0f64;
+    let mut g1 = 0.0f64;
+    let mut g2 = 0.0f64;
+    let mut g3 = 0.0f64;
+    let mut h0 = 0.0f64;
+    let mut h1 = 0.0f64;
+    let mut h2 = 0.0f64;
+    let mut h3 = 0.0f64;
+    let mut chunks = indices.chunks_exact(4);
+    for chunk in &mut chunks {
+        let r0 = chunk[0] as usize;
+        let r1 = chunk[1] as usize;
+        let r2 = chunk[2] as usize;
+        let r3 = chunk[3] as usize;
+        g0 += gradients[r0];
+        g1 += gradients[r1];
+        g2 += gradients[r2];
+        g3 += gradients[r3];
+        h0 += hessians[r0];
+        h1 += hessians[r1];
+        h2 += hessians[r2];
+        h3 += hessians[r3];
+    }
+    let mut g = (g0 + g1) + (g2 + g3);
+    let mut h = (h0 + h1) + (h2 + h3);
+    for &idx in chunks.remainder() {
         g += gradients[idx as usize];
         h += hessians[idx as usize];
     }
     (g, h)
+}
+
+/// Histogram accumulator for the fully-dense (no-missing) path. The 4-way
+/// unrolled body widens the data dependency chain so the CPU can issue several
+/// independent loads/scatters per cycle — the scalar version stalls waiting
+/// for each `g_hist[bin]` read-modify-write to retire before starting the next.
+#[inline]
+pub(super) fn accumulate_hist_dense(
+    col_bins: &[u16],
+    gradients: &[f64],
+    hessians: &[f64],
+    indices: &[u32],
+    g_hist: &mut [f64],
+    h_hist: &mut [f64],
+) {
+    let mut chunks = indices.chunks_exact(4);
+    for chunk in &mut chunks {
+        let r0 = chunk[0] as usize;
+        let r1 = chunk[1] as usize;
+        let r2 = chunk[2] as usize;
+        let r3 = chunk[3] as usize;
+        // Issue all four bin loads up front so the CPU can overlap them.
+        let b0 = col_bins[r0] as usize;
+        let b1 = col_bins[r1] as usize;
+        let b2 = col_bins[r2] as usize;
+        let b3 = col_bins[r3] as usize;
+        let g0 = gradients[r0];
+        let g1 = gradients[r1];
+        let g2 = gradients[r2];
+        let g3 = gradients[r3];
+        let h0 = hessians[r0];
+        let h1 = hessians[r1];
+        let h2 = hessians[r2];
+        let h3 = hessians[r3];
+        g_hist[b0] += g0;
+        h_hist[b0] += h0;
+        g_hist[b1] += g1;
+        h_hist[b1] += h1;
+        g_hist[b2] += g2;
+        h_hist[b2] += h2;
+        g_hist[b3] += g3;
+        h_hist[b3] += h3;
+    }
+    for &idx in chunks.remainder() {
+        let row = idx as usize;
+        let bin = col_bins[row] as usize;
+        g_hist[bin] += gradients[row];
+        h_hist[bin] += hessians[row];
+    }
+}
+
+/// Histogram accumulator that routes missing rows into separate sums.
+/// Reads all four loads up-front per chunk so the CPU can overlap them.
+#[inline]
+pub(super) fn accumulate_hist_with_missing(
+    col_bins: &[u16],
+    gradients: &[f64],
+    hessians: &[f64],
+    indices: &[u32],
+    g_hist: &mut [f64],
+    h_hist: &mut [f64],
+    g_miss: &mut f64,
+    h_miss: &mut f64,
+) {
+    let mut gm = *g_miss;
+    let mut hm = *h_miss;
+    let mut chunks = indices.chunks_exact(4);
+    for chunk in &mut chunks {
+        let r0 = chunk[0] as usize;
+        let r1 = chunk[1] as usize;
+        let r2 = chunk[2] as usize;
+        let r3 = chunk[3] as usize;
+        let b0 = col_bins[r0];
+        let b1 = col_bins[r1];
+        let b2 = col_bins[r2];
+        let b3 = col_bins[r3];
+        let g0 = gradients[r0];
+        let g1 = gradients[r1];
+        let g2 = gradients[r2];
+        let g3 = gradients[r3];
+        let h0 = hessians[r0];
+        let h1 = hessians[r1];
+        let h2 = hessians[r2];
+        let h3 = hessians[r3];
+        if b0 == MISSING_BIN {
+            gm += g0;
+            hm += h0;
+        } else {
+            g_hist[b0 as usize] += g0;
+            h_hist[b0 as usize] += h0;
+        }
+        if b1 == MISSING_BIN {
+            gm += g1;
+            hm += h1;
+        } else {
+            g_hist[b1 as usize] += g1;
+            h_hist[b1 as usize] += h1;
+        }
+        if b2 == MISSING_BIN {
+            gm += g2;
+            hm += h2;
+        } else {
+            g_hist[b2 as usize] += g2;
+            h_hist[b2 as usize] += h2;
+        }
+        if b3 == MISSING_BIN {
+            gm += g3;
+            hm += h3;
+        } else {
+            g_hist[b3 as usize] += g3;
+            h_hist[b3 as usize] += h3;
+        }
+    }
+    for &idx in chunks.remainder() {
+        let row = idx as usize;
+        let bin = col_bins[row];
+        let g = gradients[row];
+        let h = hessians[row];
+        if bin == MISSING_BIN {
+            gm += g;
+            hm += h;
+        } else {
+            g_hist[bin as usize] += g;
+            h_hist[bin as usize] += h;
+        }
+    }
+    *g_miss = gm;
+    *h_miss = hm;
+}
+
+/// Return (lg, lh) for the left child without re-summing when the SplitResult
+/// already cached them during the histogram scan (axis-style splits do this).
+/// Falls back to summing only when the cache is unavailable (oblique / cat_pair /
+/// candidates synthesized outside scan_feature_hist).
+#[inline]
+pub(super) fn child_left_sums(
+    sr: &SplitResult,
+    gradients: &[f64],
+    hessians: &[f64],
+    left_indices: &[u32],
+) -> (f64, f64) {
+    if sr.child_g_left.is_finite() && sr.child_h_left.is_finite() {
+        (sr.child_g_left, sr.child_h_left)
+    } else {
+        sum_gh(gradients, hessians, left_indices)
+    }
 }
 
 #[inline]
@@ -333,6 +505,61 @@ pub(super) struct SplitResult {
     pub(super) pair_map_b: Vec<u8>,
     pub(super) pair_cell_mask: u64,
     pub(super) pair_k_buckets: u8,
+    /// Cached left-child gradient/hessian sums derived from the winning split's
+    /// histogram scan. f64::NAN means "not precomputed — caller must re-sum".
+    /// Set only for axis (numeric / categorical / interval) splits where the
+    /// histogram already contains the exact partition sums.
+    pub(super) child_g_left: f64,
+    pub(super) child_h_left: f64,
+}
+
+#[derive(Clone, Copy)]
+struct NumericThresholdCandidate {
+    bin: usize,
+    missing_left: bool,
+    gain: f64,
+    lg: f64,
+    lh: f64,
+}
+
+#[inline]
+fn threshold_neighborhood_score(gain: f64, neighbor_gain: Option<f64>) -> f64 {
+    if !gain.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    if gain <= 0.0 {
+        return gain;
+    }
+    match neighbor_gain {
+        Some(next) if next.is_finite() && next > 0.0 => {
+            let stable = next.min(gain);
+            0.75 * gain + 0.25 * stable
+        }
+        Some(_) => 0.75 * gain,
+        None => 0.92 * gain,
+    }
+}
+
+#[inline]
+fn maybe_update_threshold_best(
+    cand: NumericThresholdCandidate,
+    neighbor_gain: Option<f64>,
+    best_score: &mut f64,
+    best_gain: &mut f64,
+    best_bin: &mut usize,
+    best_missing_left: &mut bool,
+    best_lg: &mut f64,
+    best_lh: &mut f64,
+) {
+    let score = threshold_neighborhood_score(cand.gain, neighbor_gain);
+    if score.is_finite() && score > *best_score {
+        *best_score = score;
+        *best_gain = score;
+        *best_bin = cand.bin;
+        *best_missing_left = cand.missing_left;
+        *best_lg = cand.lg;
+        *best_lh = cand.lh;
+    }
 }
 
 impl SplitResult {
@@ -355,6 +582,8 @@ impl SplitResult {
             pair_map_b: Vec::new(),
             pair_cell_mask: 0,
             pair_k_buckets: 0,
+            child_g_left: f64::NAN,
+            child_h_left: f64::NAN,
         }
     }
 
@@ -384,6 +613,8 @@ impl SplitResult {
             pair_map_b: Vec::new(),
             pair_cell_mask: 0,
             pair_k_buckets: 0,
+            child_g_left: f64::NAN,
+            child_h_left: f64::NAN,
         }
     }
 
@@ -413,6 +644,8 @@ impl SplitResult {
             pair_map_b: Vec::new(),
             pair_cell_mask: 0,
             pair_k_buckets: 0,
+            child_g_left: f64::NAN,
+            child_h_left: f64::NAN,
         }
     }
 
@@ -444,6 +677,8 @@ impl SplitResult {
             pair_map_b,
             pair_cell_mask,
             pair_k_buckets,
+            child_g_left: f64::NAN,
+            child_h_left: f64::NAN,
         }
     }
 }
@@ -679,6 +914,426 @@ pub(super) fn eval_fixed_split_pseudo_gain(
     let split_loss = taylor_loss_at_weight(audit_lg, audit_lh, left_w)
         + taylor_loss_at_weight(audit_rg, audit_rh, right_w);
     parent_loss - split_loss
+}
+
+#[inline]
+fn honest_fixed_split_gain_twofold_parts(
+    binned: &BinnedData,
+    gradients: &[f64],
+    hessians: &[f64],
+    node_indices: &[u32],
+    g_sum: f64,
+    h_sum: f64,
+    sr: &SplitResult,
+    lambda_reg: f64,
+    l1_reg: f64,
+    min_h: f64,
+    seed: u64,
+) -> Option<(f64, f64)> {
+    if node_indices.len() < 64 {
+        return None;
+    }
+    let mut a_idx: Vec<u32> = Vec::with_capacity(node_indices.len() / 2 + 1);
+    let mut b_idx: Vec<u32> = Vec::with_capacity(node_indices.len() / 2 + 1);
+    for &idx in node_indices {
+        let mut h = (idx as u64).wrapping_mul(0xD6E8_FD9D_50D5_1735) ^ seed;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        if (h & 1) == 0 {
+            a_idx.push(idx);
+        } else {
+            b_idx.push(idx);
+        }
+    }
+    if a_idx.len() < 24 || b_idx.len() < 24 {
+        return None;
+    }
+
+    let (a_g, a_h) = sum_gh(gradients, hessians, &a_idx);
+    let b_g = g_sum - a_g;
+    let b_h = h_sum - a_h;
+    if a_h < min_h || b_h < min_h {
+        return None;
+    }
+
+    let ab = eval_fixed_split_pseudo_gain(
+        binned, gradients, hessians, &a_idx, &b_idx, a_g, a_h, b_g, b_h, sr, lambda_reg, l1_reg,
+        min_h,
+    );
+    let ba = eval_fixed_split_pseudo_gain(
+        binned, gradients, hessians, &b_idx, &a_idx, b_g, b_h, a_g, a_h, sr, lambda_reg, l1_reg,
+        min_h,
+    );
+    (ab.is_finite() && ba.is_finite()).then_some((ab, ba))
+}
+
+#[inline]
+fn honest_fixed_split_gain_twofold(
+    binned: &BinnedData,
+    gradients: &[f64],
+    hessians: &[f64],
+    node_indices: &[u32],
+    g_sum: f64,
+    h_sum: f64,
+    sr: &SplitResult,
+    lambda_reg: f64,
+    l1_reg: f64,
+    min_h: f64,
+    seed: u64,
+) -> Option<f64> {
+    honest_fixed_split_gain_twofold_parts(
+        binned,
+        gradients,
+        hessians,
+        node_indices,
+        g_sum,
+        h_sum,
+        sr,
+        lambda_reg,
+        l1_reg,
+        min_h,
+        seed,
+    )
+    .map(|(ab, ba)| 0.5 * (ab + ba))
+}
+
+#[inline]
+fn selection_audited_split(
+    mut split: SplitResult,
+    binned: &BinnedData,
+    gradients: &[f64],
+    hessians: &[f64],
+    node_indices: &[u32],
+    g_sum: f64,
+    h_sum: f64,
+    lambda_reg: f64,
+    l1_reg: f64,
+    min_h: f64,
+    seed: u64,
+) -> SplitResult {
+    if split.gain <= 0.0
+        || !split.gain.is_finite()
+        || binned.split_pessimism <= 0.0
+        || node_indices.len() < 96
+    {
+        return split;
+    }
+
+    let Some((ab_gain, ba_gain)) = honest_fixed_split_gain_twofold_parts(
+        binned,
+        gradients,
+        hessians,
+        node_indices,
+        g_sum,
+        h_sum,
+        &split,
+        lambda_reg,
+        l1_reg,
+        min_h,
+        seed,
+    ) else {
+        return split;
+    };
+    let honest_gain = ab_gain + ba_gain;
+    if !honest_gain.is_finite() {
+        return split;
+    }
+
+    // Feature-level winner audit: each feature's best local split is lightly
+    // shrunk toward a fixed-split twofold estimate before competing with other
+    // features. This makes split selection itself prefer robust partitions,
+    // instead of only vetoing the final pooled-gain winner later.
+    let weight = (0.12 + 1.6 * binned.split_pessimism).clamp(0.0, 0.32);
+    let audited = (1.0 - weight) * split.gain + weight * honest_gain;
+    split.gain = split.gain.min(audited);
+    split
+}
+
+#[inline]
+fn sum_multi_gh(
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    indices: &[u32],
+    out_g: &mut [f64],
+    out_h: &mut [f64],
+) {
+    out_g.fill(0.0);
+    out_h.fill(0.0);
+    for &idx in indices {
+        let row = idx as usize;
+        for cls in 0..n_classes {
+            let off = cls * n_rows + row;
+            out_g[cls] += all_gradients[off];
+            out_h[cls] += all_hessians[off];
+        }
+    }
+}
+
+#[inline]
+fn fixed_split_multi_left_sums(
+    sr: &SplitResult,
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    indices: &[u32],
+    out_g: &mut [f64],
+    out_h: &mut [f64],
+) {
+    out_g.fill(0.0);
+    out_h.fill(0.0);
+    for &idx in indices {
+        let row = idx as usize;
+        if !split_goes_left_binned(sr, binned, row) {
+            continue;
+        }
+        for cls in 0..n_classes {
+            let off = cls * n_rows + row;
+            out_g[cls] += all_gradients[off];
+            out_h[cls] += all_hessians[off];
+        }
+    }
+}
+
+#[inline]
+fn multi_taylor_loss_at_weights(g: &[f64], h: &[f64], w: &[f64]) -> f64 {
+    let mut loss = 0.0;
+    for i in 0..g.len() {
+        loss += taylor_loss_at_weight(g[i], h[i], w[i]);
+    }
+    loss
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_fixed_split_multi_pseudo_gain(
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    search_indices: &[u32],
+    audit_indices: &[u32],
+    search_g: &[f64],
+    search_h: &[f64],
+    audit_g: &[f64],
+    audit_h: &[f64],
+    sr: &SplitResult,
+    lambda_reg: f64,
+    min_h: f64,
+) -> f64 {
+    if search_indices.len() <= 1 || audit_indices.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    let mut fit_lg = vec![0.0f64; n_classes];
+    let mut fit_lh = vec![0.0f64; n_classes];
+    fixed_split_multi_left_sums(
+        sr,
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        search_indices,
+        &mut fit_lg,
+        &mut fit_lh,
+    );
+
+    let mut parent_w = vec![0.0f64; n_classes];
+    let mut left_w = vec![0.0f64; n_classes];
+    let mut right_w = vec![0.0f64; n_classes];
+    let mut fit_left_h_total = 0.0f64;
+    let mut fit_right_h_total = 0.0f64;
+    for cls in 0..n_classes {
+        let fit_rg = search_g[cls] - fit_lg[cls];
+        let fit_rh = search_h[cls] - fit_lh[cls];
+        fit_left_h_total += fit_lh[cls];
+        fit_right_h_total += fit_rh;
+        parent_w[cls] = -search_g[cls] / (search_h[cls] + lambda_reg);
+        left_w[cls] = -fit_lg[cls] / (fit_lh[cls] + lambda_reg);
+        right_w[cls] = -fit_rg / (fit_rh + lambda_reg);
+    }
+    if fit_left_h_total < min_h || fit_right_h_total < min_h {
+        return f64::NEG_INFINITY;
+    }
+    if !(parent_w.iter().all(|v| v.is_finite())
+        && left_w.iter().all(|v| v.is_finite())
+        && right_w.iter().all(|v| v.is_finite()))
+    {
+        return f64::NEG_INFINITY;
+    }
+
+    let mut audit_lg = vec![0.0f64; n_classes];
+    let mut audit_lh = vec![0.0f64; n_classes];
+    fixed_split_multi_left_sums(
+        sr,
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        audit_indices,
+        &mut audit_lg,
+        &mut audit_lh,
+    );
+
+    let mut audit_rg = vec![0.0f64; n_classes];
+    let mut audit_rh = vec![0.0f64; n_classes];
+    for cls in 0..n_classes {
+        audit_rg[cls] = audit_g[cls] - audit_lg[cls];
+        audit_rh[cls] = audit_h[cls] - audit_lh[cls];
+    }
+
+    let parent_loss = multi_taylor_loss_at_weights(audit_g, audit_h, &parent_w);
+    let split_loss = multi_taylor_loss_at_weights(&audit_lg, &audit_lh, &left_w)
+        + multi_taylor_loss_at_weights(&audit_rg, &audit_rh, &right_w);
+    parent_loss - split_loss
+}
+
+#[allow(clippy::too_many_arguments)]
+fn honest_fixed_split_multi_pseudo_gain_twofold_parts(
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    node_indices: &[u32],
+    sr: &SplitResult,
+    lambda_reg: f64,
+    min_h: f64,
+    seed: u64,
+) -> Option<(f64, f64)> {
+    if node_indices.len() < 64 {
+        return None;
+    }
+    let mut a_idx: Vec<u32> = Vec::with_capacity(node_indices.len() / 2 + 1);
+    let mut b_idx: Vec<u32> = Vec::with_capacity(node_indices.len() / 2 + 1);
+    for &idx in node_indices {
+        let mut h = (idx as u64).wrapping_mul(0xD6E8_FD9D_50D5_1735) ^ seed;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        if (h & 1) == 0 {
+            a_idx.push(idx);
+        } else {
+            b_idx.push(idx);
+        }
+    }
+    if a_idx.len() < 24 || b_idx.len() < 24 {
+        return None;
+    }
+
+    let mut a_g = vec![0.0f64; n_classes];
+    let mut a_h = vec![0.0f64; n_classes];
+    let mut b_g = vec![0.0f64; n_classes];
+    let mut b_h = vec![0.0f64; n_classes];
+    sum_multi_gh(
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        &a_idx,
+        &mut a_g,
+        &mut a_h,
+    );
+    sum_multi_gh(
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        &b_idx,
+        &mut b_g,
+        &mut b_h,
+    );
+    let a_h_total: f64 = a_h.iter().sum();
+    let b_h_total: f64 = b_h.iter().sum();
+    if a_h_total < min_h || b_h_total < min_h {
+        return None;
+    }
+
+    let ab = eval_fixed_split_multi_pseudo_gain(
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        &a_idx,
+        &b_idx,
+        &a_g,
+        &a_h,
+        &b_g,
+        &b_h,
+        sr,
+        lambda_reg,
+        min_h,
+    );
+    let ba = eval_fixed_split_multi_pseudo_gain(
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        &b_idx,
+        &a_idx,
+        &b_g,
+        &b_h,
+        &a_g,
+        &a_h,
+        sr,
+        lambda_reg,
+        min_h,
+    );
+    (ab.is_finite() && ba.is_finite()).then_some((ab, ba))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selection_audited_split_multi(
+    mut split: SplitResult,
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    node_indices: &[u32],
+    lambda_reg: f64,
+    min_h: f64,
+    seed: u64,
+) -> SplitResult {
+    if split.gain <= 0.0
+        || !split.gain.is_finite()
+        || binned.split_pessimism <= 0.0
+        || node_indices.len() < 96
+    {
+        return split;
+    }
+
+    let Some((ab_gain, ba_gain)) = honest_fixed_split_multi_pseudo_gain_twofold_parts(
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        node_indices,
+        &split,
+        lambda_reg,
+        min_h,
+        seed,
+    ) else {
+        return split;
+    };
+    let honest_gain = ab_gain + ba_gain;
+    if !honest_gain.is_finite() {
+        return split;
+    }
+
+    let weight = (0.10 + 1.4 * binned.split_pessimism).clamp(0.0, 0.28);
+    let audited = (1.0 - weight) * split.gain + weight * honest_gain;
+    split.gain = split.gain.min(audited);
+    split
 }
 
 /// CLL candidate: best multi-way categorical split for a node.
@@ -2274,10 +2929,8 @@ pub(super) fn build_feature_hist(
     h_hist: &mut [f64],
 ) -> (f64, f64) {
     let feat_n_bins = binned.n_bins(feat);
-    for i in 0..feat_n_bins {
-        g_hist[i] = 0.0;
-        h_hist[i] = 0.0;
-    }
+    g_hist[..feat_n_bins].fill(0.0);
+    h_hist[..feat_n_bins].fill(0.0);
 
     let col_bins = binned.col_bins(feat);
     let mut g_miss = 0.0f64;
@@ -2326,23 +2979,18 @@ pub(super) fn build_feature_hist(
             }
             return (node_g_sum - g_present, node_h_sum - h_present);
         }
-        for &idx in node_indices {
-            let row = idx as usize;
-            let bin = col_bins[row];
-            if bin == MISSING_BIN {
-                g_miss += gradients[row];
-                h_miss += hessians[row];
-            } else {
-                g_hist[bin as usize] += gradients[row];
-                h_hist[bin as usize] += hessians[row];
-            }
-        }
+        accumulate_hist_with_missing(
+            col_bins,
+            gradients,
+            hessians,
+            node_indices,
+            g_hist,
+            h_hist,
+            &mut g_miss,
+            &mut h_miss,
+        );
     } else {
-        for &idx in node_indices {
-            let bin = col_bins[idx as usize] as usize;
-            g_hist[bin] += gradients[idx as usize];
-            h_hist[bin] += hessians[idx as usize];
-        }
+        accumulate_hist_dense(col_bins, gradients, hessians, node_indices, g_hist, h_hist);
     }
     (g_miss, h_miss)
 }
@@ -2358,6 +3006,77 @@ pub(super) fn build_node_hists(
 ) {
     let max_bins = hists.max_bins;
     let node_len = node_indices.len();
+    // ONE-PASS row-major kernel: when the row-major bin cache exists and no
+    // active feature has missing values, walk the node's rows once and update
+    // every feature's histogram together — each row's bins live in one cache
+    // line and g/h are gathered once instead of once PER FEATURE.
+    if !binned.bins_row_major_cache.is_empty()
+        && binned.bins_row_major_cache.len() == binned.n_rows * binned.n_features
+        && tree_features.len() * max_bins <= hists.g.len()
+        && tree_features.len() <= hists.g_miss.len()
+        && tree_features.iter().all(|&f| binned.n_bins(f) <= max_bins)
+        && !tree_features.iter().any(|&f| {
+            binned.feature_has_missing.get(f).copied().unwrap_or(true)
+        })
+    {
+        let nf = binned.n_features;
+        let rm = &binned.bins_row_major_cache;
+        for (fi, _) in tree_features.iter().enumerate() {
+            let off = fi * max_bins;
+            hists.g[off..off + max_bins].fill(0.0);
+            hists.h[off..off + max_bins].fill(0.0);
+            hists.g_miss[fi] = 0.0;
+            hists.h_miss[fi] = 0.0;
+        }
+        let hist_len = tree_features.len() * max_bins;
+        if node_len >= 16_384 {
+            // Row-chunked parallelism with per-chunk histograms merged in
+            // DETERMINISTIC chunk order (collect + ordered fold, not rayon
+            // reduce, so float summation order is stable run to run).
+            let parts: Vec<(Vec<f64>, Vec<f64>)> = node_indices
+                .par_chunks(8192)
+                .map(|chunk| {
+                    let mut ga = vec![0.0f64; hist_len];
+                    let mut ha = vec![0.0f64; hist_len];
+                    for &idx in chunk {
+                        let row = idx as usize;
+                        let g = gradients[row];
+                        let h = hessians[row];
+                        let base = row * nf;
+                        for (fi, &feat) in tree_features.iter().enumerate() {
+                            let bin = rm[base + feat] as usize;
+                            let off = fi * max_bins + bin;
+                            ga[off] += g;
+                            ha[off] += h;
+                        }
+                    }
+                    (ga, ha)
+                })
+                .collect();
+            for (ga, ha) in parts {
+                for (x, y) in hists.g[..hist_len].iter_mut().zip(ga.iter()) {
+                    *x += y;
+                }
+                for (x, y) in hists.h[..hist_len].iter_mut().zip(ha.iter()) {
+                    *x += y;
+                }
+            }
+        } else {
+            for &idx in node_indices {
+                let row = idx as usize;
+                let g = gradients[row];
+                let h = hessians[row];
+                let base = row * nf;
+                for (fi, &feat) in tree_features.iter().enumerate() {
+                    let bin = rm[base + feat] as usize;
+                    let off = fi * max_bins + bin;
+                    hists.g[off] += g;
+                    hists.h[off] += h;
+                }
+            }
+        }
+        return;
+    }
     let mut sparse_candidate_count = 0usize;
     let mut sparse_candidate_entries = 0usize;
     for &feat in tree_features {
@@ -2522,6 +3241,278 @@ pub(super) fn evidence_adjusted_gain(
 }
 
 #[inline]
+pub(super) fn cat_scan_cutpoints(
+    cat_bins: &[(usize, f64, f64)],
+    prototype_bins: usize,
+) -> Vec<bool> {
+    let n = cat_bins.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    let n_cut = n - 1;
+    const LOW_CARD_EXACT_LIMIT: usize = 32;
+    const AUTO_HIGH_CARD_PROTOTYPES: usize = 64;
+    let groups = if prototype_bins == 0 {
+        AUTO_HIGH_CARD_PROTOTYPES.min(n)
+    } else {
+        prototype_bins.clamp(2, n)
+    };
+    if n <= LOW_CARD_EXACT_LIMIT || (prototype_bins > 0 && n <= prototype_bins) {
+        return vec![true; n_cut];
+    }
+    let total_h = cat_bins.iter().map(|(_, _, h)| *h).sum::<f64>();
+    if total_h <= 1e-12 || !total_h.is_finite() {
+        return vec![true; n_cut];
+    }
+    let mut scan = vec![false; n_cut];
+    let mut cum_h = 0.0;
+    let mut next_group = 1usize;
+    for (i, (_, _, h)) in cat_bins.iter().take(n_cut).enumerate() {
+        cum_h += *h;
+        while next_group < groups && cum_h >= total_h * (next_group as f64) / (groups as f64) {
+            scan[i] = true;
+            next_group += 1;
+        }
+    }
+
+    // Rare-pocket rescue: the two extreme positions are the only places where a
+    // sorted-prefix categorical split can isolate one category. Always keep
+    // those candidates when compression is active.
+    scan[0] = true;
+    scan[n_cut - 1] = true;
+
+    // Residual-jump boundaries catch sharp adjacent changes that Hessian-balanced
+    // prototypes can skip when the mass is concentrated elsewhere.
+    let jump_budget = (groups / 3).clamp(2, 8).min(n_cut);
+    let mut jumps: Vec<(usize, f64)> = Vec::with_capacity(n_cut);
+    for i in 0..n_cut {
+        let (_, g_l, h_l) = cat_bins[i];
+        let (_, g_r, h_r) = cat_bins[i + 1];
+        let scale = (h_l * h_r / (h_l + h_r + 1e-12)).max(0.0).sqrt();
+        let rl = g_l / (h_l + 1e-12);
+        let rr = g_r / (h_r + 1e-12);
+        let gap = (rr - rl).abs() * scale;
+        if gap.is_finite() {
+            jumps.push((i, gap));
+        }
+    }
+    jumps.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    for &(i, _) in jumps.iter().take(jump_budget) {
+        scan[i] = true;
+    }
+
+    // Low-cost full-scan rescue: approximate every prefix using the existing
+    // aggregated stats, then exact-evaluate only the best few prefixes later.
+    let rescue_budget = (groups / 4).clamp(2, 6).min(n_cut);
+    let total_g = cat_bins.iter().map(|(_, g, _)| *g).sum::<f64>();
+    let parent_score = total_g * total_g / (total_h + 1e-12);
+    let mut approx: Vec<(usize, f64)> = Vec::with_capacity(n_cut);
+    let mut cg = 0.0f64;
+    let mut ch = 0.0f64;
+    for (i, (_, g, h)) in cat_bins.iter().take(n_cut).enumerate() {
+        cg += *g;
+        ch += *h;
+        let rg = total_g - cg;
+        let rh = total_h - ch;
+        if ch > 1e-12 && rh > 1e-12 {
+            let score = cg * cg / (ch + 1e-12) + rg * rg / (rh + 1e-12) - parent_score;
+            if score.is_finite() {
+                approx.push((i, score));
+            }
+        }
+    }
+    approx.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    for &(i, _) in approx.iter().take(rescue_budget) {
+        scan[i] = true;
+    }
+
+    if !scan.iter().any(|v| *v) {
+        scan[n_cut / 2] = true;
+    }
+    scan
+}
+
+#[inline]
+fn push_cat_order_if_new(orders: &mut Vec<Vec<(usize, f64, f64)>>, order: Vec<(usize, f64, f64)>) {
+    let duplicate = orders.iter().any(|existing| {
+        existing.len() == order.len() && existing.iter().zip(order.iter()).all(|(a, b)| a.0 == b.0)
+    });
+    if !duplicate {
+        orders.push(order);
+    }
+}
+
+#[inline]
+pub(super) fn single_output_cat_orders(
+    cat_bins: &[(usize, f64, f64)],
+    node_ratio: f64,
+    cat_smooth: f64,
+    prototype_bins: usize,
+) -> Vec<Vec<(usize, f64, f64)>> {
+    let mut orders = Vec::with_capacity(3);
+    // Dual-semantics categorical nodes: OpenML and pandas can mark ordinal
+    // state variables as categorical.  A purely nominal Fisher/LightGBM-style
+    // residual order can destroy the natural adjacent boundary (e.g.
+    // low|medium|high).  For small-cardinality categoricals, also scan the
+    // raw bin order and let the same gain/audit penalties decide whether the
+    // feature behaves as ordinal or nominal at this node.
+    if cat_bins.len() <= 32 {
+        let mut raw_order = cat_bins.to_vec();
+        raw_order.sort_by_key(|row| row.0);
+        push_cat_order_if_new(&mut orders, raw_order);
+    }
+    let mut smoothed = cat_bins.to_vec();
+    smoothed.sort_by(|a, b| {
+        let ra = (a.1 + cat_smooth * node_ratio) / (a.2 + cat_smooth);
+        let rb = (b.1 + cat_smooth * node_ratio) / (b.2 + cat_smooth);
+        ra.partial_cmp(&rb).unwrap_or(Ordering::Equal)
+    });
+    push_cat_order_if_new(&mut orders, smoothed);
+
+    if cat_bins.len() > 2 {
+        let total_h = cat_bins.iter().map(|(_, _, h)| *h).sum::<f64>().max(1e-12);
+        let mut weighted_var = 0.0f64;
+        let mut noise = 0.0f64;
+        for &(_, g, h) in cat_bins {
+            let hh = h.max(1e-12);
+            let effect = g / hh - node_ratio;
+            weighted_var += h.max(0.0) * effect * effect;
+            noise += h.max(0.0) / hh;
+        }
+        weighted_var /= total_h;
+        noise /= total_h;
+        let tau2 = (weighted_var - noise).max(0.0);
+        if tau2.is_finite() && tau2 > 1e-12 {
+            let mut eb_order = cat_bins.to_vec();
+            eb_order.sort_by(|a, b| {
+                let ha = a.2.max(1e-12);
+                let hb = b.2.max(1e-12);
+                let za = a.1 / ha - node_ratio;
+                let zb = b.1 / hb - node_ratio;
+                let sa = node_ratio + (tau2 * ha / (1.0 + tau2 * ha)) * za;
+                let sb = node_ratio + (tau2 * hb / (1.0 + tau2 * hb)) * zb;
+                sa.partial_cmp(&sb).unwrap_or(Ordering::Equal)
+            });
+            push_cat_order_if_new(&mut orders, eb_order);
+        }
+    }
+
+    if prototype_bins > 0 && cat_bins.len() > prototype_bins.max(32) {
+        let mut raw_ratio = cat_bins.to_vec();
+        raw_ratio.sort_by(|a, b| {
+            let ra = a.1 / (a.2 + 1e-12);
+            let rb = b.1 / (b.2 + 1e-12);
+            ra.partial_cmp(&rb).unwrap_or(Ordering::Equal)
+        });
+        push_cat_order_if_new(&mut orders, raw_ratio);
+
+        let smooth_h = cat_smooth.max(1.0);
+        let mut rare_signal = cat_bins.to_vec();
+        rare_signal.sort_by(|a, b| {
+            let ra = (a.1 - node_ratio * a.2) / (a.2 + smooth_h).sqrt();
+            let rb = (b.1 - node_ratio * b.2) / (b.2 + smooth_h).sqrt();
+            ra.partial_cmp(&rb).unwrap_or(Ordering::Equal)
+        });
+        push_cat_order_if_new(&mut orders, rare_signal);
+    }
+
+    orders
+}
+
+#[inline]
+pub(super) fn categorical_audit_adjusted_gain(
+    binned: &BinnedData,
+    gain: f64,
+    left_h: f64,
+    right_h: f64,
+    parent_h: f64,
+    lambda_reg: f64,
+    n_cutpoints: usize,
+) -> f64 {
+    let strength = binned.cat_audit_strength;
+    if strength <= 0.0 || !gain.is_finite() || gain <= 0.0 {
+        return gain;
+    };
+
+    let search_width = (n_cutpoints.max(2) as f64).ln();
+    let audit_h = left_h.min(right_h).max(0.0);
+    let reliability = audit_h / (audit_h + strength * search_width).max(1e-12);
+    let l = (left_h + lambda_reg).max(1e-12);
+    let r = (right_h + lambda_reg).max(1e-12);
+    let p = (parent_h + lambda_reg).max(1e-12);
+    let curvature_risk = (0.5 * (1.0 / l + 1.0 / r - 1.0 / p)).max(0.0);
+    gain * reliability - strength * search_width * curvature_risk
+}
+
+#[inline]
+pub(super) fn contrast_adjusted_gain(
+    binned: &BinnedData,
+    feat: usize,
+    gain: f64,
+    left_g: f64,
+    left_h: f64,
+    right_g: f64,
+    right_h: f64,
+    lambda_reg: f64,
+    l1_reg: f64,
+    n_cutpoints: usize,
+) -> f64 {
+    let strength = binned.split_contrast_penalty;
+    if strength <= 0.0 || !gain.is_finite() || gain <= 0.0 {
+        return gain;
+    }
+
+    let left_w = l1_leaf_value(left_g, left_h, lambda_reg, l1_reg);
+    let right_w = l1_leaf_value(right_g, right_h, lambda_reg, l1_reg);
+    let contrast = (left_w - right_w).abs();
+    if !contrast.is_finite() || contrast <= 1e-15 {
+        return 0.0;
+    }
+
+    let l = (left_h + lambda_reg).max(1e-12);
+    let r = (right_h + lambda_reg).max(1e-12);
+    let se2 = (1.0 / l + 1.0 / r).max(1e-12);
+    let z2 = (contrast * contrast / se2).max(0.0);
+    let search_width = ((binned.n_features.max(1) * n_cutpoints.max(1)).max(2) as f64).ln();
+
+    // Selected splits are winner's-curse biased: among M tested thresholds, a
+    // pure-noise contrast can still look large. Treat the left/right Newton
+    // value difference as a 1-df Wald statistic and apply a positive-part
+    // empirical-Bayes correction. Strong contrasts keep almost all their gain;
+    // weak contrasts selected from a wide search surface collapse to zero.
+    let threshold = strength * search_width.max(1.0);
+    let adjusted = if z2 <= threshold {
+        0.0
+    } else {
+        gain * (1.0 - threshold / z2).clamp(0.0, 1.0)
+    };
+
+    if adjusted <= 0.0
+        || binned.n_raw_features == 0
+        || feat < binned.n_raw_features
+        || binned.n_features <= binned.n_raw_features
+    {
+        return adjusted;
+    }
+
+    // Synthetic features are selected from a much wider implicit operator
+    // family than raw columns. Price that extra search surface generically,
+    // using the same support reliability idea as split_pessimism. This is not
+    // tied to any dataset or operator; it simply asks derived columns to show
+    // more child support before they can dominate ordinary splits.
+    let n_raw = binned.n_raw_features.max(2);
+    let pair_surface = (n_raw.saturating_mul(n_raw.saturating_sub(1)) / 2).max(2);
+    let derived_width = (pair_surface as f64).ln().max(1.0);
+    let derived_strength = binned.split_pessimism.max(0.10 * strength);
+    if derived_strength <= 0.0 {
+        return adjusted;
+    }
+    let evidence_h = left_h.min(right_h).max(0.0);
+    let reliability = evidence_h / (evidence_h + derived_strength * derived_width).max(1e-12);
+    adjusted * reliability
+}
+
+#[inline]
 fn missing_route_penalty(parent_h: f64, missing_h: f64) -> f64 {
     let observed_h = (parent_h - missing_h).max(0.0);
     if missing_h <= 1e-12 || observed_h <= 1e-12 {
@@ -2654,6 +3645,8 @@ fn eval_numeric_interval_split_from_hist(
     let mut best_lo = 0usize;
     let mut best_hi = 0usize;
     let mut best_missing_left = false;
+    let mut best_lg = f64::NAN;
+    let mut best_lh = f64::NAN;
 
     for (lo, hi) in candidates {
         let ig = prefix_g[hi + 1] - prefix_g[lo];
@@ -2724,6 +3717,18 @@ fn eval_numeric_interval_split_from_hist(
                         - 1.0 / (h_sum + lambda_reg));
             }
             gain = evidence_adjusted_gain(binned, gain, lh, rh, h_sum, lambda_reg, search_width);
+            gain = contrast_adjusted_gain(
+                binned,
+                feat,
+                gain,
+                lg,
+                lh,
+                rg,
+                rh,
+                lambda_reg,
+                l1_reg,
+                search_width,
+            );
             gain -= missing_route_penalty(h_sum, h_miss);
             if random_strength > 0.0 && gain > 0.0 {
                 let key = (lo * feat_n_bins + hi) * 2 + usize::from(missing_left);
@@ -2734,6 +3739,8 @@ fn eval_numeric_interval_split_from_hist(
                 best_lo = lo;
                 best_hi = hi;
                 best_missing_left = missing_left;
+                best_lg = lg;
+                best_lh = lh;
             }
         }
     }
@@ -2746,12 +3753,102 @@ fn eval_numeric_interval_split_from_hist(
     for bin in best_lo..=best_hi {
         bitmask_set(&mut mask, bin);
     }
-    SplitResult::axis(best_gain, feat, 0, best_missing_left, true, mask)
+    let mut sr = SplitResult::axis(best_gain, feat, 0, best_missing_left, true, mask);
+    sr.child_g_left = best_lg;
+    sr.child_h_left = best_lh;
+    sr
 }
 
 /// Scan a pre-built histogram for the best split point of a single feature.
 /// Same categorical + numerical logic as eval_feature_split, but reads from buffers.
 #[inline]
+/// Tight-loop numeric scan for the dominant case: dense feature (no missing
+/// mass at this node), L1 off, no monotone constraint, and every gain
+/// adjustment knob inactive. Replicates the general path's float-op order
+/// exactly (including the threshold-neighborhood scoring), so results are
+/// bit-identical — it only strips the per-bin function-call machinery and adds
+/// a monotone early-break once the right side falls below min_child_weight.
+/// This is the kernel: per-bin cost drops roughly an order of magnitude.
+#[inline]
+fn scan_feature_hist_fast_numeric(
+    feat: usize,
+    g_hist: &[f64],
+    h_hist: &[f64],
+    feat_n_bins: usize,
+    g_sum: f64,
+    h_sum: f64,
+    lambda_reg: f64,
+    gamma: f64,
+    min_h: f64,
+) -> SplitResult {
+    let parent_score = (g_sum * g_sum) / (h_sum + lambda_reg);
+    let mut cum_g = 0.0f64;
+    let mut cum_h = 0.0f64;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_gain = f64::NEG_INFINITY;
+    let mut best_bin = 0usize;
+    let mut best_lg = f64::NAN;
+    let mut best_lh = f64::NAN;
+    let mut prev: Option<NumericThresholdCandidate> = None;
+    for bin in 0..feat_n_bins - 1 {
+        let h_bin = h_hist[bin];
+        cum_g += g_hist[bin];
+        cum_h += h_bin;
+        if h_bin == 0.0 {
+            continue;
+        }
+        let other_h = h_sum - cum_h;
+        if other_h < min_h {
+            break; // monotone: only shrinks from here on
+        }
+        if cum_h < min_h {
+            continue;
+        }
+        let other_g = g_sum - cum_g;
+        let gain = 0.5
+            * (cum_g * cum_g / (cum_h + lambda_reg) + other_g * other_g / (other_h + lambda_reg)
+                - parent_score)
+            - gamma;
+        if gain.is_finite() {
+            if let Some(p) = prev {
+                maybe_update_threshold_best(
+                    p,
+                    Some(gain),
+                    &mut best_score,
+                    &mut best_gain,
+                    &mut best_bin,
+                    &mut true,
+                    &mut best_lg,
+                    &mut best_lh,
+                );
+            }
+            prev = Some(NumericThresholdCandidate {
+                bin,
+                missing_left: true,
+                gain,
+                lg: cum_g,
+                lh: cum_h,
+            });
+        }
+    }
+    if let Some(p) = prev {
+        maybe_update_threshold_best(
+            p,
+            None,
+            &mut best_score,
+            &mut best_gain,
+            &mut best_bin,
+            &mut true,
+            &mut best_lg,
+            &mut best_lh,
+        );
+    }
+    let mut sr = SplitResult::axis(best_gain, feat, best_bin, true, false, Vec::new());
+    sr.child_g_left = best_lg;
+    sr.child_h_left = best_lh;
+    sr
+}
+
 pub(super) fn scan_feature_hist(
     feat: usize,
     binned: &BinnedData,
@@ -2776,6 +3873,31 @@ pub(super) fn scan_feature_hist(
     if feat_n_bins <= 1 {
         return SplitResult::axis(f64::NEG_INFINITY, feat, 0, true, false, Vec::new());
     }
+    // Kernel fast path (see scan_feature_hist_fast_numeric).
+    if !binned.is_categorical[feat]
+        && g_miss == 0.0
+        && h_miss == 0.0
+        && l1_reg == 0.0
+        && mono_cstr == 0
+        && random_strength <= 0.0
+        && gain_penalty <= 0.0
+        && !interval_splits
+        && binned.split_pessimism <= 0.0
+        && binned.split_contrast_penalty <= 0.0
+        && binned.cat_audit_strength <= 0.0
+    {
+        return scan_feature_hist_fast_numeric(
+            feat,
+            g_hist,
+            h_hist,
+            feat_n_bins,
+            g_sum,
+            h_sum,
+            lambda_reg,
+            gamma,
+            min_h,
+        );
+    }
 
     let g_nm = g_sum - g_miss;
     let h_nm = h_sum - h_miss;
@@ -2785,8 +3907,12 @@ pub(super) fn scan_feature_hist(
     let mut best_missing_left = true;
     let mut best_is_cat = false;
     let mut best_cat_split_idx: usize = 0;
+    let mut best_cat_bins: Vec<(usize, f64, f64)> = Vec::new();
     let missing_penalty = missing_route_penalty(h_sum, h_miss);
 
+    let mut best_lg = f64::NAN;
+    let mut best_lh = f64::NAN;
+    let mut best_score = f64::NEG_INFINITY;
     if binned.is_categorical[feat] {
         let mut cat_bins: Vec<(usize, f64, f64)> = Vec::new();
         for bin in 0..feat_n_bins {
@@ -2796,89 +3922,149 @@ pub(super) fn scan_feature_hist(
         }
         if cat_bins.len() > 1 {
             let node_ratio = if h_nm > 1e-10 { g_nm / h_nm } else { 0.0 };
-            cat_bins.sort_by(|a, b| {
-                let ra = (a.1 + cat_smooth * node_ratio) / (a.2 + cat_smooth);
-                let rb = (b.1 + cat_smooth * node_ratio) / (b.2 + cat_smooth);
-                ra.partial_cmp(&rb).unwrap_or(Ordering::Equal)
-            });
+            let cat_orders = single_output_cat_orders(
+                &cat_bins,
+                node_ratio,
+                cat_smooth,
+                binned.cat_prototype_bins,
+            );
 
-            let mut cum_g = 0.0f64;
-            let mut cum_h = 0.0f64;
-            for i in 0..cat_bins.len() - 1 {
-                cum_g += cat_bins[i].1;
-                cum_h += cat_bins[i].2;
-                let other_g = g_nm - cum_g;
-                let other_h = h_nm - cum_h;
+            for ordered_bins in cat_orders {
+                let cat_cutpoints = cat_scan_cutpoints(&ordered_bins, binned.cat_prototype_bins);
+                let cat_search_width = cat_cutpoints.iter().filter(|&&v| v).count().max(1);
 
-                let lg = cum_g + g_miss;
-                let lh = cum_h + h_miss;
-                if lh >= min_h && other_h >= min_h {
-                    let mut gain = 0.5
-                        * (l1_gain_score(lg, lh, lambda_reg, l1_reg)
-                            + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
-                            - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
-                        - gamma;
-                    if gain_penalty > 0.0 {
-                        gain -= gain_penalty
-                            * 0.5
-                            * (1.0 / (lh + lambda_reg) + 1.0 / (other_h + lambda_reg)
-                                - 1.0 / (h_sum + lambda_reg));
+                let mut cum_g = 0.0f64;
+                let mut cum_h = 0.0f64;
+                for i in 0..ordered_bins.len() - 1 {
+                    cum_g += ordered_bins[i].1;
+                    cum_h += ordered_bins[i].2;
+                    if !cat_cutpoints.get(i).copied().unwrap_or(true) {
+                        continue;
                     }
-                    gain = evidence_adjusted_gain(
-                        binned,
-                        gain,
-                        lh,
-                        other_h,
-                        h_sum,
-                        lambda_reg,
-                        cat_bins.len().saturating_sub(1),
-                    );
-                    gain -= missing_penalty;
-                    if random_strength > 0.0 && gain > 0.0 {
-                        gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2);
-                    }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = 0;
-                        best_missing_left = true;
-                        best_is_cat = true;
-                        best_cat_split_idx = i;
-                    }
-                }
+                    let other_g = g_nm - cum_g;
+                    let other_h = h_nm - cum_h;
 
-                if cum_h >= min_h && (other_h + h_miss) >= min_h {
-                    let rg = other_g + g_miss;
-                    let rh = other_h + h_miss;
-                    let mut gain = 0.5
-                        * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
-                            + l1_gain_score(rg, rh, lambda_reg, l1_reg)
-                            - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
-                        - gamma;
-                    if gain_penalty > 0.0 {
-                        gain -= gain_penalty
-                            * 0.5
-                            * (1.0 / (cum_h + lambda_reg) + 1.0 / (rh + lambda_reg)
-                                - 1.0 / (h_sum + lambda_reg));
+                    let lg = cum_g + g_miss;
+                    let lh = cum_h + h_miss;
+                    if lh >= min_h && other_h >= min_h {
+                        let mut gain = 0.5
+                            * (l1_gain_score(lg, lh, lambda_reg, l1_reg)
+                                + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
+                                - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
+                            - gamma;
+                        if gain_penalty > 0.0 {
+                            gain -= gain_penalty
+                                * 0.5
+                                * (1.0 / (lh + lambda_reg) + 1.0 / (other_h + lambda_reg)
+                                    - 1.0 / (h_sum + lambda_reg));
+                        }
+                        gain = evidence_adjusted_gain(
+                            binned,
+                            gain,
+                            lh,
+                            other_h,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            lh,
+                            other_h,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = contrast_adjusted_gain(
+                            binned,
+                            feat,
+                            gain,
+                            lg,
+                            lh,
+                            other_g,
+                            other_h,
+                            lambda_reg,
+                            l1_reg,
+                            cat_search_width,
+                        );
+                        gain -= missing_penalty;
+                        if random_strength > 0.0 && gain > 0.0 {
+                            gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2);
+                        }
+                        if gain.is_finite() && gain > best_gain {
+                            best_gain = gain;
+                            best_bin = 0;
+                            best_missing_left = true;
+                            best_is_cat = true;
+                            best_cat_split_idx = i;
+                            best_cat_bins.clear();
+                            best_cat_bins.extend_from_slice(&ordered_bins);
+                            best_lg = lg;
+                            best_lh = lh;
+                        }
                     }
-                    gain = evidence_adjusted_gain(
-                        binned,
-                        gain,
-                        cum_h,
-                        rh,
-                        h_sum,
-                        lambda_reg,
-                        cat_bins.len().saturating_sub(1),
-                    );
-                    gain -= missing_penalty;
-                    if random_strength > 0.0 && gain > 0.0 {
-                        gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2 + 1);
-                    }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = 0;
-                        best_missing_left = false;
-                        best_is_cat = true;
-                        best_cat_split_idx = i;
+
+                    if cum_h >= min_h && (other_h + h_miss) >= min_h {
+                        let rg = other_g + g_miss;
+                        let rh = other_h + h_miss;
+                        let mut gain = 0.5
+                            * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
+                                + l1_gain_score(rg, rh, lambda_reg, l1_reg)
+                                - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
+                            - gamma;
+                        if gain_penalty > 0.0 {
+                            gain -= gain_penalty
+                                * 0.5
+                                * (1.0 / (cum_h + lambda_reg) + 1.0 / (rh + lambda_reg)
+                                    - 1.0 / (h_sum + lambda_reg));
+                        }
+                        gain = evidence_adjusted_gain(
+                            binned,
+                            gain,
+                            cum_h,
+                            rh,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            cum_h,
+                            rh,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = contrast_adjusted_gain(
+                            binned,
+                            feat,
+                            gain,
+                            cum_g,
+                            cum_h,
+                            rg,
+                            rh,
+                            lambda_reg,
+                            l1_reg,
+                            cat_search_width,
+                        );
+                        gain -= missing_penalty;
+                        if random_strength > 0.0 && gain > 0.0 {
+                            gain *=
+                                1.0 + random_strength * split_noise(noise_seed, feat, i * 2 + 1);
+                        }
+                        if gain.is_finite() && gain > best_gain {
+                            best_gain = gain;
+                            best_bin = 0;
+                            best_missing_left = false;
+                            best_is_cat = true;
+                            best_cat_split_idx = i;
+                            best_cat_bins.clear();
+                            best_cat_bins.extend_from_slice(&ordered_bins);
+                            best_lg = cum_g;
+                            best_lh = cum_h;
+                        }
                     }
                 }
             }
@@ -2886,16 +4072,29 @@ pub(super) fn scan_feature_hist(
         if best_is_cat {
             let mut mask: CatBitmask = Vec::new();
             for j in 0..=best_cat_split_idx {
-                bitmask_set(&mut mask, cat_bins[j].0);
+                bitmask_set(&mut mask, best_cat_bins[j].0);
             }
-            return SplitResult::axis(best_gain, feat, best_bin, best_missing_left, true, mask);
+            let mut sr =
+                SplitResult::axis(best_gain, feat, best_bin, best_missing_left, true, mask);
+            sr.child_g_left = best_lg;
+            sr.child_h_left = best_lh;
+            return sr;
         }
     } else {
         let mut cum_g = 0.0f64;
         let mut cum_h = 0.0f64;
+        let mut prev_left: Option<NumericThresholdCandidate> = None;
+        let mut prev_right: Option<NumericThresholdCandidate> = None;
         for bin in 0..feat_n_bins - 1 {
-            cum_g += g_hist[bin];
-            cum_h += h_hist[bin];
+            let g_bin = g_hist[bin];
+            let h_bin = h_hist[bin];
+            cum_g += g_bin;
+            cum_h += h_bin;
+            // Empty bin contributes nothing — splitting here gives the same
+            // partition as the previous non-empty bin. Skip the gain math.
+            if h_bin == 0.0 {
+                continue;
+            }
             let other_g = g_nm - cum_g;
             let other_h = h_nm - cum_h;
 
@@ -2934,21 +4133,53 @@ pub(super) fn scan_feature_hist(
                         lambda_reg,
                         feat_n_bins.saturating_sub(1),
                     );
+                    gain = contrast_adjusted_gain(
+                        binned,
+                        feat,
+                        gain,
+                        lg,
+                        lh,
+                        other_g,
+                        other_h,
+                        lambda_reg,
+                        l1_reg,
+                        feat_n_bins.saturating_sub(1),
+                    );
                     gain -= missing_penalty;
                     if random_strength > 0.0 && gain > 0.0 {
                         gain *= 1.0 + random_strength * split_noise(noise_seed, feat, bin * 2);
                     }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = bin;
-                        best_missing_left = true;
+                    if gain.is_finite() {
+                        if let Some(prev) = prev_left {
+                            maybe_update_threshold_best(
+                                prev,
+                                Some(gain),
+                                &mut best_score,
+                                &mut best_gain,
+                                &mut best_bin,
+                                &mut best_missing_left,
+                                &mut best_lg,
+                                &mut best_lh,
+                            );
+                        }
+                        prev_left = Some(NumericThresholdCandidate {
+                            bin,
+                            missing_left: true,
+                            gain,
+                            lg,
+                            lh,
+                        });
                     }
                 }
             }
 
             let rg = other_g + g_miss;
             let rh = other_h + h_miss;
-            if cum_h >= min_h && rh >= min_h {
+            // With no missing mass the two routing directions are identical
+            // (lg==cum_g etc.) and the left-direction candidate above already
+            // covered this threshold — skip the duplicate gain evaluation.
+            // This halves the per-bin scan cost on dense features.
+            if cum_h >= min_h && rh >= min_h && (g_miss != 0.0 || h_miss != 0.0) {
                 let mono_ok = if mono_cstr == 0 {
                     true
                 } else {
@@ -2981,21 +4212,73 @@ pub(super) fn scan_feature_hist(
                         lambda_reg,
                         feat_n_bins.saturating_sub(1),
                     );
+                    gain = contrast_adjusted_gain(
+                        binned,
+                        feat,
+                        gain,
+                        cum_g,
+                        cum_h,
+                        rg,
+                        rh,
+                        lambda_reg,
+                        l1_reg,
+                        feat_n_bins.saturating_sub(1),
+                    );
                     gain -= missing_penalty;
                     if random_strength > 0.0 && gain > 0.0 {
                         gain *= 1.0 + random_strength * split_noise(noise_seed, feat, bin * 2 + 1);
                     }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = bin;
-                        best_missing_left = false;
+                    if gain.is_finite() {
+                        if let Some(prev) = prev_right {
+                            maybe_update_threshold_best(
+                                prev,
+                                Some(gain),
+                                &mut best_score,
+                                &mut best_gain,
+                                &mut best_bin,
+                                &mut best_missing_left,
+                                &mut best_lg,
+                                &mut best_lh,
+                            );
+                        }
+                        prev_right = Some(NumericThresholdCandidate {
+                            bin,
+                            missing_left: false,
+                            gain,
+                            lg: cum_g,
+                            lh: cum_h,
+                        });
                     }
                 }
             }
         }
+        if let Some(prev) = prev_left {
+            maybe_update_threshold_best(
+                prev,
+                None,
+                &mut best_score,
+                &mut best_gain,
+                &mut best_bin,
+                &mut best_missing_left,
+                &mut best_lg,
+                &mut best_lh,
+            );
+        }
+        if let Some(prev) = prev_right {
+            maybe_update_threshold_best(
+                prev,
+                None,
+                &mut best_score,
+                &mut best_gain,
+                &mut best_bin,
+                &mut best_missing_left,
+                &mut best_lg,
+                &mut best_lh,
+            );
+        }
     }
 
-    let axis = SplitResult::axis(
+    let mut axis = SplitResult::axis(
         best_gain,
         feat,
         best_bin,
@@ -3003,6 +4286,8 @@ pub(super) fn scan_feature_hist(
         false,
         Vec::new(),
     );
+    axis.child_g_left = best_lg;
+    axis.child_h_left = best_lh;
     if interval_splits && mono_cstr == 0 && !binned.is_categorical[feat] {
         let interval = eval_numeric_interval_split_from_hist(
             binned,
@@ -3058,36 +4343,40 @@ pub(super) fn eval_feature_split(
     }
 
     let col_bins = binned.col_bins(feat);
-    for i in 0..feat_n_bins {
-        g_hist[i] = 0.0;
-        h_hist[i] = 0.0;
-    }
+    // `slice.fill` lowers to a memset for f64 (the bit pattern of `0.0` is all
+    // zeros), which the index-based reset blocked.
+    g_hist[..feat_n_bins].fill(0.0);
+    h_hist[..feat_n_bins].fill(0.0);
 
     let mut g_miss = 0.0f64;
     let mut h_miss = 0.0f64;
 
-    // Fast path: skip MISSING_BIN branch when no missing values exist for this feature.
-    // This eliminates a branch per sample in the histogram loop (common case).
-    let has_missing = node_indices
-        .iter()
-        .any(|&idx| col_bins[idx as usize] == MISSING_BIN);
+    // Skip the per-node MISSING_BIN probe when the feature is globally dense
+    // (the O(1) flag rules out missing rows in every subset). For features that
+    // *can* have missing rows we still probe so a node that happens to be all
+    // present takes the cheaper dense loop.
+    let feature_could_have_missing = binned
+        .feature_has_missing
+        .get(feat)
+        .copied()
+        .unwrap_or(true);
+    let has_missing = feature_could_have_missing
+        && node_indices
+            .iter()
+            .any(|&idx| col_bins[idx as usize] == MISSING_BIN);
     if has_missing {
-        for &idx in node_indices {
-            let bin = col_bins[idx as usize];
-            if bin == MISSING_BIN {
-                g_miss += gradients[idx as usize];
-                h_miss += hessians[idx as usize];
-            } else {
-                g_hist[bin as usize] += gradients[idx as usize];
-                h_hist[bin as usize] += hessians[idx as usize];
-            }
-        }
+        accumulate_hist_with_missing(
+            col_bins,
+            gradients,
+            hessians,
+            node_indices,
+            g_hist,
+            h_hist,
+            &mut g_miss,
+            &mut h_miss,
+        );
     } else {
-        for &idx in node_indices {
-            let bin = col_bins[idx as usize] as usize;
-            g_hist[bin] += gradients[idx as usize];
-            h_hist[bin] += hessians[idx as usize];
-        }
+        accumulate_hist_dense(col_bins, gradients, hessians, node_indices, g_hist, h_hist);
     }
 
     let g_nm = g_sum - g_miss;
@@ -3099,6 +4388,7 @@ pub(super) fn eval_feature_split(
     let mut best_is_cat = false;
     // For categorical: track the best split index into sorted cat_bins to build mask once at the end
     let mut best_cat_split_idx: usize = 0;
+    let mut best_cat_bins: Vec<(usize, f64, f64)> = Vec::new();
     let missing_penalty = missing_route_penalty(h_sum, h_miss);
 
     if binned.is_categorical[feat] {
@@ -3108,93 +4398,154 @@ pub(super) fn eval_feature_split(
                 cat_bins.push((bin, g_hist[bin], h_hist[bin]));
             }
         }
+        let mut best_lg = f64::NAN;
+        let mut best_lh = f64::NAN;
         if cat_bins.len() > 1 {
-            // Smooth g/h ratio toward node mean so rare categories don't dominate sort
             let node_ratio = if h_nm > 1e-10 { g_nm / h_nm } else { 0.0 };
-            cat_bins.sort_by(|a, b| {
-                let ra = (a.1 + cat_smooth * node_ratio) / (a.2 + cat_smooth);
-                let rb = (b.1 + cat_smooth * node_ratio) / (b.2 + cat_smooth);
-                ra.partial_cmp(&rb).unwrap_or(Ordering::Equal)
-            });
+            let cat_orders = single_output_cat_orders(
+                &cat_bins,
+                node_ratio,
+                cat_smooth,
+                binned.cat_prototype_bins,
+            );
 
-            // Phase 1: Sort-and-scan to find best contiguous partition
-            let mut cum_g = 0.0f64;
-            let mut cum_h = 0.0f64;
-            for i in 0..cat_bins.len() - 1 {
-                cum_g += cat_bins[i].1;
-                cum_h += cat_bins[i].2;
-                let other_g = g_nm - cum_g;
-                let other_h = h_nm - cum_h;
+            // Phase 1: sort-and-scan candidate orders. The first order is the
+            // standard smoothed G/H order; extra orders rescue rare pockets.
+            for ordered_bins in cat_orders {
+                let cat_cutpoints = cat_scan_cutpoints(&ordered_bins, binned.cat_prototype_bins);
+                let cat_search_width = cat_cutpoints.iter().filter(|&&v| v).count().max(1);
+                let mut cum_g = 0.0f64;
+                let mut cum_h = 0.0f64;
+                for i in 0..ordered_bins.len() - 1 {
+                    cum_g += ordered_bins[i].1;
+                    cum_h += ordered_bins[i].2;
+                    if !cat_cutpoints.get(i).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let other_g = g_nm - cum_g;
+                    let other_h = h_nm - cum_h;
 
-                let lg = cum_g + g_miss;
-                let lh = cum_h + h_miss;
-                if lh >= min_h && other_h >= min_h {
-                    let mut gain = 0.5
-                        * (l1_gain_score(lg, lh, lambda_reg, l1_reg)
-                            + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
-                            - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
-                        - gamma;
-                    if gain_penalty > 0.0 {
-                        gain -= gain_penalty
-                            * 0.5
-                            * (1.0 / (lh + lambda_reg) + 1.0 / (other_h + lambda_reg)
-                                - 1.0 / (h_sum + lambda_reg));
+                    let lg = cum_g + g_miss;
+                    let lh = cum_h + h_miss;
+                    if lh >= min_h && other_h >= min_h {
+                        let mut gain = 0.5
+                            * (l1_gain_score(lg, lh, lambda_reg, l1_reg)
+                                + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
+                                - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
+                            - gamma;
+                        if gain_penalty > 0.0 {
+                            gain -= gain_penalty
+                                * 0.5
+                                * (1.0 / (lh + lambda_reg) + 1.0 / (other_h + lambda_reg)
+                                    - 1.0 / (h_sum + lambda_reg));
+                        }
+                        gain = evidence_adjusted_gain(
+                            binned,
+                            gain,
+                            lh,
+                            other_h,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            lh,
+                            other_h,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = contrast_adjusted_gain(
+                            binned,
+                            feat,
+                            gain,
+                            lg,
+                            lh,
+                            other_g,
+                            other_h,
+                            lambda_reg,
+                            l1_reg,
+                            cat_search_width,
+                        );
+                        gain -= missing_penalty;
+                        if random_strength > 0.0 && gain > 0.0 {
+                            gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2);
+                        }
+                        if gain.is_finite() && gain > best_gain {
+                            best_gain = gain;
+                            best_bin = 0;
+                            best_missing_left = true;
+                            best_is_cat = true;
+                            best_cat_split_idx = i;
+                            best_cat_bins.clear();
+                            best_cat_bins.extend_from_slice(&ordered_bins);
+                            best_lg = lg;
+                            best_lh = lh;
+                        }
                     }
-                    gain = evidence_adjusted_gain(
-                        binned,
-                        gain,
-                        lh,
-                        other_h,
-                        h_sum,
-                        lambda_reg,
-                        cat_bins.len().saturating_sub(1),
-                    );
-                    gain -= missing_penalty;
-                    if random_strength > 0.0 && gain > 0.0 {
-                        gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2);
-                    }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = 0;
-                        best_missing_left = true;
-                        best_is_cat = true;
-                        best_cat_split_idx = i;
-                    }
-                }
 
-                if cum_h >= min_h && (other_h + h_miss) >= min_h {
-                    let rg = other_g + g_miss;
-                    let rh = other_h + h_miss;
-                    let mut gain = 0.5
-                        * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
-                            + l1_gain_score(rg, rh, lambda_reg, l1_reg)
-                            - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
-                        - gamma;
-                    if gain_penalty > 0.0 {
-                        gain -= gain_penalty
-                            * 0.5
-                            * (1.0 / (cum_h + lambda_reg) + 1.0 / (rh + lambda_reg)
-                                - 1.0 / (h_sum + lambda_reg));
-                    }
-                    gain = evidence_adjusted_gain(
-                        binned,
-                        gain,
-                        cum_h,
-                        rh,
-                        h_sum,
-                        lambda_reg,
-                        cat_bins.len().saturating_sub(1),
-                    );
-                    gain -= missing_penalty;
-                    if random_strength > 0.0 && gain > 0.0 {
-                        gain *= 1.0 + random_strength * split_noise(noise_seed, feat, i * 2 + 1);
-                    }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = 0;
-                        best_missing_left = false;
-                        best_is_cat = true;
-                        best_cat_split_idx = i;
+                    if cum_h >= min_h && (other_h + h_miss) >= min_h {
+                        let rg = other_g + g_miss;
+                        let rh = other_h + h_miss;
+                        let mut gain = 0.5
+                            * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
+                                + l1_gain_score(rg, rh, lambda_reg, l1_reg)
+                                - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
+                            - gamma;
+                        if gain_penalty > 0.0 {
+                            gain -= gain_penalty
+                                * 0.5
+                                * (1.0 / (cum_h + lambda_reg) + 1.0 / (rh + lambda_reg)
+                                    - 1.0 / (h_sum + lambda_reg));
+                        }
+                        gain = evidence_adjusted_gain(
+                            binned,
+                            gain,
+                            cum_h,
+                            rh,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            cum_h,
+                            rh,
+                            h_sum,
+                            lambda_reg,
+                            cat_search_width,
+                        );
+                        gain = contrast_adjusted_gain(
+                            binned,
+                            feat,
+                            gain,
+                            cum_g,
+                            cum_h,
+                            rg,
+                            rh,
+                            lambda_reg,
+                            l1_reg,
+                            cat_search_width,
+                        );
+                        gain -= missing_penalty;
+                        if random_strength > 0.0 && gain > 0.0 {
+                            gain *=
+                                1.0 + random_strength * split_noise(noise_seed, feat, i * 2 + 1);
+                        }
+                        if gain.is_finite() && gain > best_gain {
+                            best_gain = gain;
+                            best_bin = 0;
+                            best_missing_left = false;
+                            best_is_cat = true;
+                            best_cat_split_idx = i;
+                            best_cat_bins.clear();
+                            best_cat_bins.extend_from_slice(&ordered_bins);
+                            best_lg = cum_g;
+                            best_lh = cum_h;
+                        }
                     }
                 }
             }
@@ -3203,16 +4554,35 @@ pub(super) fn eval_feature_split(
         if best_is_cat {
             let mut mask: CatBitmask = Vec::new();
             for j in 0..=best_cat_split_idx {
-                bitmask_set(&mut mask, cat_bins[j].0);
+                bitmask_set(&mut mask, best_cat_bins[j].0);
             }
-            return SplitResult::axis(best_gain, feat, best_bin, best_missing_left, true, mask);
+            let mut sr =
+                SplitResult::axis(best_gain, feat, best_bin, best_missing_left, true, mask);
+            sr.child_g_left = best_lg;
+            sr.child_h_left = best_lh;
+            return sr;
         }
     } else {
         let mut cum_g = 0.0f64;
         let mut cum_h = 0.0f64;
+        let mut best_lg = f64::NAN;
+        let mut best_lh = f64::NAN;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut prev_left: Option<NumericThresholdCandidate> = None;
+        let mut prev_right: Option<NumericThresholdCandidate> = None;
         for bin in 0..feat_n_bins - 1 {
-            cum_g += g_hist[bin];
-            cum_h += h_hist[bin];
+            let g_bin = g_hist[bin];
+            let h_bin = h_hist[bin];
+            cum_g += g_bin;
+            cum_h += h_bin;
+            // Empty bin (no rows mapped here): splitting at `bin` yields the
+            // exact same partition as splitting at the previous populated bin,
+            // so skip the gain math. Per-bin random noise differs by a hash but
+            // that affects only the recorded best_bin, not the actual split
+            // boundary the tree records, so the model output is unchanged.
+            if h_bin == 0.0 {
+                continue;
+            }
             let other_g = g_nm - cum_g;
             let other_h = h_nm - cum_h;
 
@@ -3252,14 +4622,42 @@ pub(super) fn eval_feature_split(
                         lambda_reg,
                         feat_n_bins.saturating_sub(1),
                     );
+                    gain = contrast_adjusted_gain(
+                        binned,
+                        feat,
+                        gain,
+                        lg,
+                        lh,
+                        other_g,
+                        other_h,
+                        lambda_reg,
+                        l1_reg,
+                        feat_n_bins.saturating_sub(1),
+                    );
                     gain -= missing_penalty;
                     if random_strength > 0.0 && gain > 0.0 {
                         gain *= 1.0 + random_strength * split_noise(noise_seed, feat, bin * 2);
                     }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = bin;
-                        best_missing_left = true;
+                    if gain.is_finite() {
+                        if let Some(prev) = prev_left {
+                            maybe_update_threshold_best(
+                                prev,
+                                Some(gain),
+                                &mut best_score,
+                                &mut best_gain,
+                                &mut best_bin,
+                                &mut best_missing_left,
+                                &mut best_lg,
+                                &mut best_lh,
+                            );
+                        }
+                        prev_left = Some(NumericThresholdCandidate {
+                            bin,
+                            missing_left: true,
+                            gain,
+                            lg,
+                            lh,
+                        });
                     }
                 }
             }
@@ -3300,18 +4698,104 @@ pub(super) fn eval_feature_split(
                         lambda_reg,
                         feat_n_bins.saturating_sub(1),
                     );
+                    gain = contrast_adjusted_gain(
+                        binned,
+                        feat,
+                        gain,
+                        cum_g,
+                        cum_h,
+                        rg,
+                        rh,
+                        lambda_reg,
+                        l1_reg,
+                        feat_n_bins.saturating_sub(1),
+                    );
                     gain -= missing_penalty;
                     if random_strength > 0.0 && gain > 0.0 {
                         gain *= 1.0 + random_strength * split_noise(noise_seed, feat, bin * 2 + 1);
                     }
-                    if gain.is_finite() && gain > best_gain {
-                        best_gain = gain;
-                        best_bin = bin;
-                        best_missing_left = false;
+                    if gain.is_finite() {
+                        if let Some(prev) = prev_right {
+                            maybe_update_threshold_best(
+                                prev,
+                                Some(gain),
+                                &mut best_score,
+                                &mut best_gain,
+                                &mut best_bin,
+                                &mut best_missing_left,
+                                &mut best_lg,
+                                &mut best_lh,
+                            );
+                        }
+                        prev_right = Some(NumericThresholdCandidate {
+                            bin,
+                            missing_left: false,
+                            gain,
+                            lg: cum_g,
+                            lh: cum_h,
+                        });
                     }
                 }
             }
         }
+        if let Some(prev) = prev_left {
+            maybe_update_threshold_best(
+                prev,
+                None,
+                &mut best_score,
+                &mut best_gain,
+                &mut best_bin,
+                &mut best_missing_left,
+                &mut best_lg,
+                &mut best_lh,
+            );
+        }
+        if let Some(prev) = prev_right {
+            maybe_update_threshold_best(
+                prev,
+                None,
+                &mut best_score,
+                &mut best_gain,
+                &mut best_bin,
+                &mut best_missing_left,
+                &mut best_lg,
+                &mut best_lh,
+            );
+        }
+        let mut axis_out = SplitResult::axis(
+            best_gain,
+            feat,
+            best_bin,
+            best_missing_left,
+            false,
+            Vec::new(),
+        );
+        axis_out.child_g_left = best_lg;
+        axis_out.child_h_left = best_lh;
+        if interval_splits && mono_cstr == 0 && !binned.is_categorical[feat] {
+            let interval = eval_numeric_interval_split_from_hist(
+                binned,
+                feat,
+                g_hist,
+                h_hist,
+                g_miss,
+                h_miss,
+                g_sum,
+                h_sum,
+                lambda_reg,
+                l1_reg,
+                gamma,
+                min_h,
+                random_strength,
+                noise_seed,
+                gain_penalty,
+            );
+            let required_gain = axis_out.gain.max(0.0) * 1.5 + 1e-12;
+            if interval.gain > required_gain {
+                return interval;
+            }
+        }
+        return axis_out;
     }
 
     let axis = SplitResult::axis(
@@ -3679,18 +5163,23 @@ pub(super) fn eval_feature_split_multi(
 
     let use_coupled_gain = coupled_split_gain
         && n_classes >= 3
-        && all_probs.len() >= n_rows * n_classes
+        && all_probs.len() >= n_rows.saturating_mul(n_classes)
         && parent_p_sums.len() >= n_classes
-        && parent_pp_sums.len() >= n_classes * n_classes;
+        && parent_pp_sums.len() >= n_classes.saturating_mul(n_classes)
+        && p_hists.len() >= feat_n_bins.saturating_mul(n_classes)
+        && pp_hists.len()
+            >= feat_n_bins
+                .saturating_mul(n_classes)
+                .saturating_mul(n_classes)
+        && p_miss.len() >= n_classes
+        && pp_miss.len() >= n_classes.saturating_mul(n_classes);
     let max_bins = g_hists.len() / n_classes;
     let col_bins = binned.col_bins(feat);
 
     for k in 0..n_classes {
         let base = k * max_bins;
-        for i in 0..feat_n_bins {
-            g_hists[base + i] = 0.0;
-            h_hists[base + i] = 0.0;
-        }
+        g_hists[base..base + feat_n_bins].fill(0.0);
+        h_hists[base..base + feat_n_bins].fill(0.0);
         g_miss[k] = 0.0;
         h_miss[k] = 0.0;
         if use_coupled_gain {
@@ -3848,7 +5337,224 @@ pub(super) fn eval_feature_split_multi(
                 scalar_scores[bin] = (proj_g + cat_smooth * node_ratio) / (total_h + cat_smooth);
             }
 
+            const EXACT_MULTI_CAT_SUBSET_MAX_BINS: usize = 8;
+            if cat_bins.len() <= EXACT_MULTI_CAT_SUBSET_MAX_BINS {
+                let n_active = cat_bins.len();
+                let search_width = (1usize << n_active.saturating_sub(1))
+                    .saturating_sub(1)
+                    .max(1);
+                let mut left_g = if use_coupled_gain {
+                    vec![0.0f64; n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut right_g = if use_coupled_gain {
+                    vec![0.0f64; n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut left_p = if use_coupled_gain {
+                    vec![0.0f64; n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut right_p = if use_coupled_gain {
+                    vec![0.0f64; n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut left_pp = if use_coupled_gain {
+                    vec![0.0f64; n_classes * n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut right_pp = if use_coupled_gain {
+                    vec![0.0f64; n_classes * n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut dense_a = if use_coupled_gain {
+                    vec![0.0f64; n_classes * n_classes]
+                } else {
+                    Vec::new()
+                };
+                let mut dense_rhs = if use_coupled_gain {
+                    vec![0.0f64; n_classes]
+                } else {
+                    Vec::new()
+                };
+                for subset in 1usize..(1usize << n_active.saturating_sub(1)) {
+                    let mut subset_bins: Vec<usize> = Vec::new();
+                    let mut subset_g = vec![0.0f64; n_classes];
+                    let mut subset_h = vec![0.0f64; n_classes];
+                    let mut subset_p = if use_coupled_gain {
+                        vec![0.0f64; n_classes]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut subset_pp = if use_coupled_gain {
+                        vec![0.0f64; n_classes * n_classes]
+                    } else {
+                        Vec::new()
+                    };
+                    for (pos, &bin) in cat_bins.iter().enumerate() {
+                        if ((subset >> pos) & 1) == 0 {
+                            continue;
+                        }
+                        subset_bins.push(bin);
+                        for k in 0..n_classes {
+                            subset_g[k] += g_hists[k * max_bins + bin];
+                            subset_h[k] += h_hists[k * max_bins + bin];
+                        }
+                        if use_coupled_gain {
+                            let p_base = bin * n_classes;
+                            let pp_base = bin * n_classes * n_classes;
+                            for k in 0..n_classes {
+                                subset_p[k] += p_hists[p_base + k];
+                            }
+                            for kk in 0..(n_classes * n_classes) {
+                                subset_pp[kk] += pp_hists[pp_base + kk];
+                            }
+                        }
+                    }
+                    if subset_bins.is_empty() {
+                        continue;
+                    }
+                    for miss_dir in 0..2u8 {
+                        let miss_left = miss_dir == 0;
+                        let mut gain = 0.0f64;
+                        let mut total_lh = 0.0f64;
+                        let mut total_rh = 0.0f64;
+                        for k in 0..n_classes {
+                            let g_nm_k = g_sums[k] - g_miss[k];
+                            let h_nm_k = h_sums[k] - h_miss[k];
+                            let (lg, lh, rg, rh) = if miss_left {
+                                (
+                                    subset_g[k] + g_miss[k],
+                                    subset_h[k] + h_miss[k],
+                                    g_nm_k - subset_g[k],
+                                    h_nm_k - subset_h[k],
+                                )
+                            } else {
+                                (
+                                    subset_g[k],
+                                    subset_h[k],
+                                    g_nm_k - subset_g[k] + g_miss[k],
+                                    h_nm_k - subset_h[k] + h_miss[k],
+                                )
+                            };
+                            if use_coupled_gain {
+                                left_g[k] = lg;
+                                right_g[k] = rg;
+                            } else {
+                                gain += lg * lg / (lh + lambda_reg) + rg * rg / (rh + lambda_reg);
+                            }
+                            total_lh += lh;
+                            total_rh += rh;
+                        }
+                        if total_lh < min_h || total_rh < min_h {
+                            continue;
+                        }
+                        if use_coupled_gain {
+                            for k in 0..n_classes {
+                                left_p[k] = if miss_left {
+                                    subset_p[k] + p_miss[k]
+                                } else {
+                                    subset_p[k]
+                                };
+                                right_p[k] = parent_p_sums[k] - left_p[k];
+                            }
+                            for kk in 0..(n_classes * n_classes) {
+                                left_pp[kk] = if miss_left {
+                                    subset_pp[kk] + pp_miss[kk]
+                                } else {
+                                    subset_pp[kk]
+                                };
+                                right_pp[kk] = parent_pp_sums[kk] - left_pp[kk];
+                            }
+                            let left_obj = dense_multiclass_gain(
+                                &left_g,
+                                &left_p,
+                                &left_pp,
+                                lambda_reg,
+                                &mut dense_a,
+                                &mut dense_rhs,
+                            );
+                            let right_obj = dense_multiclass_gain(
+                                &right_g,
+                                &right_p,
+                                &right_pp,
+                                lambda_reg,
+                                &mut dense_a,
+                                &mut dense_rhs,
+                            );
+                            gain = 0.5 * (left_obj + right_obj - parent_obj) - gamma;
+                        } else {
+                            gain = 0.5 * (gain - parent_obj) - gamma;
+                        }
+                        if gain_penalty > 0.0 {
+                            let mut pen = 0.0;
+                            for k in 0..n_classes {
+                                let h_nm_k = h_sums[k] - h_miss[k];
+                                let (lh, rh) = if miss_left {
+                                    (subset_h[k] + h_miss[k], h_nm_k - subset_h[k])
+                                } else {
+                                    (subset_h[k], h_nm_k - subset_h[k] + h_miss[k])
+                                };
+                                pen += 1.0 / (lh + lambda_reg) + 1.0 / (rh + lambda_reg)
+                                    - 1.0 / (h_sums[k] + lambda_reg);
+                            }
+                            gain -= gain_penalty * 0.5 * pen;
+                        }
+                        gain = evidence_adjusted_gain(
+                            binned,
+                            gain,
+                            total_lh,
+                            total_rh,
+                            total_lh + total_rh,
+                            lambda_reg,
+                            search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            total_lh,
+                            total_rh,
+                            total_lh + total_rh,
+                            lambda_reg,
+                            search_width,
+                        );
+                        gain -= missing_penalty;
+                        if random_strength > 0.0 && gain > 0.0 {
+                            gain *= 1.0
+                                + random_strength
+                                    * split_noise(noise_seed, feat, subset * 2 + miss_dir as usize);
+                        }
+                        if gain.is_finite() && gain > best_gain {
+                            best_gain = gain;
+                            best_bin = 0;
+                            best_missing_left = miss_left;
+                            best_is_cat = true;
+                            best_cat_split_idx = subset_bins.len() - 1;
+                            best_cat_bins.clear();
+                            best_cat_bins.extend_from_slice(&subset_bins);
+                        }
+                    }
+                }
+            }
+
             let mut eval_cat_order = |ordered_bins: &[usize]| {
+                let proto_bins: Vec<(usize, f64, f64)> = ordered_bins
+                    .iter()
+                    .map(|&bin| {
+                        let total_h = (0..n_classes)
+                            .map(|k| h_hists[k * max_bins + bin])
+                            .sum::<f64>();
+                        (bin, scalar_scores[bin] * total_h, total_h)
+                    })
+                    .collect();
+                let cat_cutpoints = cat_scan_cutpoints(&proto_bins, binned.cat_prototype_bins);
+                let cat_search_width = cat_cutpoints.iter().filter(|&&v| v).count().max(1);
                 let mut cum_g = vec![0.0f64; n_classes];
                 let mut cum_h = vec![0.0f64; n_classes];
                 let mut cum_p = if use_coupled_gain {
@@ -3917,6 +5623,9 @@ pub(super) fn eval_feature_split_multi(
                         for kk in 0..(n_classes * n_classes) {
                             cum_pp[kk] += pp_hists[pp_base + kk];
                         }
+                    }
+                    if !cat_cutpoints.get(i).copied().unwrap_or(true) {
+                        continue;
                     }
                     for miss_dir in 0..2u8 {
                         let miss_left = miss_dir == 0;
@@ -4008,7 +5717,16 @@ pub(super) fn eval_feature_split_multi(
                             total_rh,
                             total_lh + total_rh,
                             lambda_reg,
-                            ordered_bins.len().saturating_sub(1),
+                            cat_search_width,
+                        );
+                        gain = categorical_audit_adjusted_gain(
+                            binned,
+                            gain,
+                            total_lh,
+                            total_rh,
+                            total_lh + total_rh,
+                            lambda_reg,
+                            cat_search_width,
                         );
                         gain -= missing_penalty;
                         if random_strength > 0.0 && gain > 0.0 {
@@ -4039,6 +5757,9 @@ pub(super) fn eval_feature_split_multi(
                     .partial_cmp(&scalar_scores[b])
                     .unwrap_or(Ordering::Equal)
             });
+            if cat_bins.len() <= 32 {
+                eval_cat_order(&cat_bins);
+            }
             eval_cat_order(&scalar_sorted);
 
             if n_classes >= 3 {
@@ -4303,6 +6024,61 @@ pub(super) fn eval_feature_split_multi(
 pub(super) fn normalized_bin_coord(n_bins: usize, bin: u16) -> f64 {
     let denom = n_bins.saturating_sub(1).max(1) as f64;
     2.0 * (bin as f64) / denom - 1.0
+}
+
+/// Hist-backed attention scoring: identical score to `attended_numeric_features`
+/// but read from the node's ALREADY-BUILT histograms (hist-subtraction cache) —
+/// zero row walks instead of one full per-feature pass per node.
+pub(super) fn attended_numeric_features_from_hists(
+    binned: &BinnedData,
+    hists: &NodeHists,
+    tree_features: &[usize],
+    active_features: &[usize],
+    g_sum: f64,
+    h_sum: f64,
+    lambda_reg: f64,
+    monotone_constraints: &[i8],
+    top_k: usize,
+) -> Vec<usize> {
+    let node_value = -g_sum / (h_sum + lambda_reg).max(1e-12);
+    let max_bins = hists.max_bins;
+    let mut scored: Vec<(f64, usize)> = Vec::new();
+    for &feat in active_features {
+        if binned.is_categorical[feat]
+            || binned.n_bins(feat) <= 1
+            || monotone_constraints.get(feat).copied().unwrap_or(0) != 0
+        {
+            continue;
+        }
+        let Ok(pos) = tree_features.binary_search(&feat) else {
+            continue;
+        };
+        let feat_n_bins = binned.n_bins(feat).min(max_bins);
+        let offset = pos * max_bins;
+        let g_bins = &hists.g[offset..offset + feat_n_bins];
+        let h_bins = &hists.h[offset..offset + feat_n_bins];
+        let cover_h: f64 = h_bins.iter().sum();
+        if cover_h <= 1e-12 {
+            continue;
+        }
+        let mut score = 0.0f64;
+        for bin in 0..feat_n_bins {
+            let hb = h_bins[bin];
+            if hb <= 1e-12 {
+                continue;
+            }
+            let leaf_value = -g_bins[bin] / (hb + lambda_reg).max(1e-12);
+            let delta = leaf_value - node_value;
+            score += hb * delta * delta;
+        }
+        score *= cover_h / (h_sum + 1e-12);
+        if score.is_finite() && score > 0.0 {
+            scored.push((score, feat));
+        }
+    }
+    scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    scored.truncate(top_k);
+    scored.into_iter().map(|(_, feat)| feat).collect()
 }
 
 pub(super) fn attended_numeric_features(
@@ -4588,7 +6364,12 @@ pub(super) fn eval_sparse_oblique_candidate(
     let mut rhs1 = 0.0f64;
     let mut n_valid = 0usize;
 
-    for &idx in node_indices {
+    // Direction estimation is a 2-D weighted least squares — a few thousand
+    // rows pin the weights statistically; stride-subsample huge nodes instead
+    // of paying O(n) here per candidate pair.
+    const OBLIQUE_FIT_ROWS: usize = 4096;
+    let stride = (node_indices.len() / OBLIQUE_FIT_ROWS).max(1);
+    for &idx in node_indices.iter().step_by(stride) {
         let row = idx as usize;
         let b0 = binned.get_bin_u16(row, f0);
         let b1 = binned.get_bin_u16(row, f1);
@@ -4609,6 +6390,7 @@ pub(super) fn eval_sparse_oblique_candidate(
     if n_valid < 4 {
         return SplitResult::empty();
     }
+    let n_valid = node_indices.len().min(n_valid * stride);
 
     let ridge = 1e-3 * (s00 + s11).max(1e-6);
     let a00 = s00 + ridge;
@@ -4631,25 +6413,72 @@ pub(super) fn eval_sparse_oblique_candidate(
     let stored_w1 = w1 * scale1;
     let stored_shift = w0 + w1;
 
-    let mut rows: Vec<(f64, u32)> = Vec::with_capacity(n_valid);
+    #[derive(Clone, Copy)]
+    struct ProjectionStat {
+        proj: f64,
+        g: f64,
+        h: f64,
+    }
+
+    // Scan on a COARSENED cell grid (<=64x64): the projection is a synthetic
+    // 1-D feature, and 4096 candidate cells is already far finer than the raw
+    // axis resolution. This turns the old O(n log n) per-pair row sort into a
+    // single O(n) accumulation plus an O(4096 log 4096) constant-cost sort —
+    // the dominant cost of oblique splits on large nodes.
+    const OBLIQUE_GRID: usize = 64;
+    let c0 = n_bins0.min(OBLIQUE_GRID);
+    let c1 = n_bins1.min(OBLIQUE_GRID);
+    let pair_space = c0 * c1;
+    let mut rows: Vec<ProjectionStat> = Vec::with_capacity(pair_space.min(node_indices.len()));
     let mut g_miss = 0.0f64;
     let mut h_miss = 0.0f64;
-    for &idx in node_indices {
-        let row = idx as usize;
-        let b0 = binned.get_bin_u16(row, f0);
-        let b1 = binned.get_bin_u16(row, f1);
-        if b0 == MISSING_BIN || b1 == MISSING_BIN {
-            g_miss += gradients[row];
-            h_miss += hessians[row];
-            continue;
+
+    {
+        let mut seen = vec![false; pair_space];
+        let mut g_cells = vec![0.0f64; pair_space];
+        let mut h_cells = vec![0.0f64; pair_space];
+        let mut proj_cells = vec![0.0f64; pair_space];
+        let mut touched: Vec<usize> = Vec::with_capacity(pair_space.min(node_indices.len()));
+
+        for &idx in node_indices {
+            let row = idx as usize;
+            let b0 = binned.get_bin_u16(row, f0);
+            let b1 = binned.get_bin_u16(row, f1);
+            if b0 == MISSING_BIN || b1 == MISSING_BIN {
+                g_miss += gradients[row];
+                h_miss += hessians[row];
+                continue;
+            }
+            let cb0 = (b0 as usize * c0) / n_bins0;
+            let cb1 = (b1 as usize * c1) / n_bins1;
+            let key = cb0 * c1 + cb1;
+            if !seen[key] {
+                seen[key] = true;
+                touched.push(key);
+            }
+            // Hessian-weighted mean projection per cell: accumulate h-weighted
+            // coords so the cell's threshold sits where its mass sits.
+            let proj =
+                w0 * normalized_bin_coord(n_bins0, b0) + w1 * normalized_bin_coord(n_bins1, b1);
+            let h = hessians[row].max(1e-12);
+            proj_cells[key] += h * proj;
+            g_cells[key] += gradients[row];
+            h_cells[key] += hessians[row];
         }
-        let proj = w0 * normalized_bin_coord(n_bins0, b0) + w1 * normalized_bin_coord(n_bins1, b1);
-        rows.push((proj, idx));
+
+        for key in touched {
+            let h = h_cells[key].max(1e-12);
+            rows.push(ProjectionStat {
+                proj: proj_cells[key] / h,
+                g: g_cells[key],
+                h: h_cells[key],
+            });
+        }
     }
     if rows.len() < 2 {
         return SplitResult::empty();
     }
-    rows.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    rows.sort_unstable_by(|a, b| a.proj.partial_cmp(&b.proj).unwrap_or(Ordering::Equal));
 
     let g_nm = g_sum - g_miss;
     let h_nm = h_sum - h_miss;
@@ -4658,13 +6487,12 @@ pub(super) fn eval_sparse_oblique_candidate(
     let mut cum_h = 0.0f64;
 
     for pos in 0..rows.len() - 1 {
-        let row = rows[pos].1 as usize;
-        cum_g += gradients[row];
-        cum_h += hessians[row];
-        if rows[pos].0 + 1e-12 >= rows[pos + 1].0 {
+        cum_g += rows[pos].g;
+        cum_h += rows[pos].h;
+        if rows[pos].proj + 1e-12 >= rows[pos + 1].proj {
             continue;
         }
-        let threshold_center = 0.5 * (rows[pos].0 + rows[pos + 1].0);
+        let threshold_center = 0.5 * (rows[pos].proj + rows[pos + 1].proj);
         let threshold_raw = threshold_center + stored_shift;
         let other_g = g_nm - cum_g;
         let other_h = h_nm - cum_h;
@@ -4683,7 +6511,7 @@ pub(super) fn eval_sparse_oblique_candidate(
                 other_h,
                 h_sum,
                 lambda_reg,
-                rows.len().saturating_sub(1),
+                n_valid.saturating_sub(1),
             );
             gain -= missing_route_penalty(h_sum, h_miss);
             if gain.is_finite() && gain > best.gain {
@@ -4712,7 +6540,7 @@ pub(super) fn eval_sparse_oblique_candidate(
                 rh,
                 h_sum,
                 lambda_reg,
-                rows.len().saturating_sub(1),
+                n_valid.saturating_sub(1),
             );
             gain -= missing_route_penalty(h_sum, h_miss);
             if gain.is_finite() && gain > best.gain {
@@ -4743,42 +6571,267 @@ pub(super) fn find_sparse_oblique_split(
     gamma: f64,
     min_h: f64,
     monotone_constraints: &[i8],
+    cached_hists: Option<(&NodeHists, &[usize])>,
 ) -> SplitResult {
-    let numeric_feats = attended_numeric_features(
-        binned,
-        gradients,
-        hessians,
-        node_indices,
-        active_features,
-        g_sum,
-        h_sum,
-        lambda_reg,
-        monotone_constraints,
-        4,
-    );
+    // Top-3 on big nodes (3 pairs instead of 6 — the pair loop dominates large-
+    // node cost); top-4 on small nodes where the extra pairs are nearly free.
+    let attend_k = if node_indices.len() > 4096 { 3 } else { 4 };
+    let numeric_feats = if let Some((hists, tree_features)) = cached_hists {
+        attended_numeric_features_from_hists(
+            binned,
+            hists,
+            tree_features,
+            active_features,
+            g_sum,
+            h_sum,
+            lambda_reg,
+            monotone_constraints,
+            attend_k,
+        )
+    } else {
+        attended_numeric_features(
+            binned,
+            gradients,
+            hessians,
+            node_indices,
+            active_features,
+            g_sum,
+            h_sum,
+            lambda_reg,
+            monotone_constraints,
+            attend_k,
+        )
+    };
     if numeric_feats.len() < 2 || node_indices.len() < 16 {
         return SplitResult::empty();
     }
 
-    let mut best = SplitResult::empty();
-    for i0 in 0..numeric_feats.len() {
-        for i1 in i0 + 1..numeric_feats.len() {
-            let cand = eval_sparse_oblique_candidate(
-                binned,
-                gradients,
-                hessians,
-                node_indices,
-                g_sum,
-                h_sum,
-                lambda_reg,
-                gamma,
-                min_h,
-                numeric_feats[i0],
-                numeric_feats[i1],
-            );
-            if cand.gain > best.gain {
-                best = cand;
+    // FUSED pair evaluation: every candidate pair draws from the same <=4
+    // attended features, so gather each row's bins ONCE per pass and feed all
+    // pairs simultaneously — 2 row passes total (strided LS fit + full cell
+    // accumulation) instead of 2 passes PER PAIR. This is the dominant cost
+    // of oblique splits on large nodes.
+    let k = numeric_feats.len();
+    let nb: Vec<usize> = numeric_feats.iter().map(|&f| binned.n_bins(f)).collect();
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(k * (k - 1) / 2);
+    for i in 0..k {
+        for j in (i + 1)..k {
+            if nb[i] > 1 && nb[j] > 1 {
+                pairs.push((i, j));
             }
+        }
+    }
+    if pairs.is_empty() {
+        return SplitResult::empty();
+    }
+    let np = pairs.len();
+
+    // Phase 1: strided weighted-least-squares direction fit, all pairs at once.
+    const OBLIQUE_FIT_ROWS: usize = 4096;
+    let stride = (node_indices.len() / OBLIQUE_FIT_ROWS).max(1);
+    let mut ls = vec![[0.0f64; 6]; np]; // s00, s01, s11, rhs0, rhs1, n_valid
+    let mut bins_buf = vec![0u16; k];
+    for &idx in node_indices.iter().step_by(stride) {
+        let row = idx as usize;
+        for (fi, &f) in numeric_feats.iter().enumerate() {
+            bins_buf[fi] = binned.get_bin_u16(row, f);
+        }
+        let h = hessians[row].max(1e-12);
+        let t = -gradients[row] / (hessians[row] + lambda_reg).max(1e-12);
+        for (pi, &(i, j)) in pairs.iter().enumerate() {
+            let (b0, b1) = (bins_buf[i], bins_buf[j]);
+            if b0 == MISSING_BIN || b1 == MISSING_BIN {
+                continue;
+            }
+            let x0 = normalized_bin_coord(nb[i], b0);
+            let x1 = normalized_bin_coord(nb[j], b1);
+            let s = &mut ls[pi];
+            s[0] += h * x0 * x0;
+            s[1] += h * x0 * x1;
+            s[2] += h * x1 * x1;
+            s[3] += h * x0 * t;
+            s[4] += h * x1 * t;
+            s[5] += 1.0;
+        }
+    }
+    // Solve per-pair 2x2 systems -> unit direction weights.
+    let mut weights = vec![None::<(f64, f64)>; np];
+    for (pi, s) in ls.iter().enumerate() {
+        if s[5] < 4.0 {
+            continue;
+        }
+        let ridge = 1e-3 * (s[0] + s[2]).max(1e-6);
+        let a00 = s[0] + ridge;
+        let a11 = s[2] + ridge;
+        let det = a00 * a11 - s[1] * s[1];
+        if !det.is_finite() || det.abs() <= 1e-12 {
+            continue;
+        }
+        let mut w0 = (s[3] * a11 - s[4] * s[1]) / det;
+        let mut w1 = (s[4] * a00 - s[3] * s[1]) / det;
+        let norm = (w0 * w0 + w1 * w1).sqrt();
+        if !norm.is_finite() || norm <= 1e-8 {
+            continue;
+        }
+        w0 /= norm;
+        w1 /= norm;
+        weights[pi] = Some((w0, w1));
+    }
+    // Compact to ACTIVE pairs so the hot per-row loop below carries no dead
+    // branches (Option checks per row per dead pair).
+    let active: Vec<(usize, usize, usize, f64, f64)> = pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(pi, &(i, j))| weights[pi].map(|(w0, w1)| (pi, i, j, w0, w1)))
+        .collect();
+    if active.is_empty() {
+        return SplitResult::empty();
+    }
+
+    // Phase 2: ONE full pass accumulating every pair's coarse cell grid.
+    // Grid scaled to node size: a 50-row node must not allocate+zero a 64x64
+    // grid per pair (the alloc churn dominates at the thousands of small
+    // nodes deep in each tree). cells ~ O(node rows) keeps zeroing amortized.
+    let grid_cap = (((2 * node_indices.len()) as f64).sqrt().ceil() as usize).clamp(4, 64);
+    let c: Vec<usize> = nb.iter().map(|&b| b.min(grid_cap)).collect();
+    let cell_count: Vec<usize> = pairs.iter().map(|&(i, j)| c[i] * c[j]).collect();
+    let cell_off: Vec<usize> = {
+        let mut off = vec![0usize; np + 1];
+        for pi in 0..np {
+            off[pi + 1] = off[pi] + if weights[pi].is_some() { cell_count[pi] } else { 0 };
+        }
+        off
+    };
+    let total_cells = cell_off[np];
+    let mut g_cells = vec![0.0f64; total_cells];
+    let mut h_cells = vec![0.0f64; total_cells];
+    let mut p_cells = vec![0.0f64; total_cells];
+    let mut miss = vec![(0.0f64, 0.0f64); np];
+    for &idx in node_indices {
+        let row = idx as usize;
+        for (fi, &f) in numeric_feats.iter().enumerate() {
+            bins_buf[fi] = binned.get_bin_u16(row, f);
+        }
+        let g = gradients[row];
+        let h = hessians[row];
+        for &(pi, i, j, w0, w1) in &active {
+            let (b0, b1) = (bins_buf[i], bins_buf[j]);
+            if b0 == MISSING_BIN || b1 == MISSING_BIN {
+                miss[pi].0 += g;
+                miss[pi].1 += h;
+                continue;
+            }
+            let cb0 = (b0 as usize * c[i]) / nb[i];
+            let cb1 = (b1 as usize * c[j]) / nb[j];
+            let cell = cell_off[pi] + cb0 * c[j] + cb1;
+            let proj = w0 * normalized_bin_coord(nb[i], b0) + w1 * normalized_bin_coord(nb[j], b1);
+            g_cells[cell] += g;
+            h_cells[cell] += h;
+            p_cells[cell] += h.max(1e-12) * proj;
+        }
+    }
+
+    // Per-pair: sort occupied cells by projection, scan thresholds.
+    let mut best = SplitResult::empty();
+    let mut stats: Vec<(f64, f64, f64)> = Vec::new(); // (proj, g, h)
+    for (pi, &(i, j)) in pairs.iter().enumerate() {
+        let Some((w0, w1)) = weights[pi] else { continue };
+        let f0 = numeric_feats[i];
+        let f1 = numeric_feats[j];
+        let scale0 = 2.0 / nb[i].saturating_sub(1).max(1) as f64;
+        let scale1 = 2.0 / nb[j].saturating_sub(1).max(1) as f64;
+        let stored_w0 = w0 * scale0;
+        let stored_w1 = w1 * scale1;
+        let stored_shift = w0 + w1;
+        let (g_miss, h_miss) = miss[pi];
+        stats.clear();
+        for cell in cell_off[pi]..cell_off[pi] + cell_count[pi] {
+            if h_cells[cell] > 0.0 {
+                stats.push((
+                    p_cells[cell] / h_cells[cell].max(1e-12),
+                    g_cells[cell],
+                    h_cells[cell],
+                ));
+            }
+        }
+        if stats.len() < 2 {
+            continue;
+        }
+        stats.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        let n_valid = node_indices.len();
+        let g_nm = g_sum - g_miss;
+        let h_nm = h_sum - h_miss;
+        let mut cum_g = 0.0f64;
+        let mut cum_h = 0.0f64;
+        for pos in 0..stats.len() - 1 {
+            cum_g += stats[pos].1;
+            cum_h += stats[pos].2;
+            if stats[pos].0 + 1e-12 >= stats[pos + 1].0 {
+                continue;
+            }
+            let threshold_raw = 0.5 * (stats[pos].0 + stats[pos + 1].0) + stored_shift;
+            let other_g = g_nm - cum_g;
+            let other_h = h_nm - cum_h;
+            for (lg, lh, rg, rh, miss_left) in [
+                (cum_g + g_miss, cum_h + h_miss, other_g, other_h, true),
+                (cum_g, cum_h, other_g + g_miss, other_h + h_miss, false),
+            ] {
+                if lh < min_h || rh < min_h {
+                    continue;
+                }
+                let mut gain = 0.5
+                    * (lg * lg / (lh + lambda_reg) + rg * rg / (rh + lambda_reg)
+                        - g_sum * g_sum / (h_sum + lambda_reg))
+                    - gamma;
+                gain = evidence_adjusted_gain(
+                    binned,
+                    gain,
+                    lh,
+                    rh,
+                    h_sum,
+                    lambda_reg,
+                    n_valid.saturating_sub(1),
+                );
+                gain -= missing_route_penalty(h_sum, h_miss);
+                if gain.is_finite() && gain > best.gain {
+                    best = SplitResult::oblique(
+                        gain,
+                        f0,
+                        miss_left,
+                        [f0 as u32, f1 as u32],
+                        [stored_w0 as f32, stored_w1 as f32],
+                        threshold_raw as f32,
+                    );
+                }
+            }
+        }
+    }
+
+    if best.gain.is_finite() && best.gain > 0.0 {
+        let audit_seed = ((best.oblique_feats[0] as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ ((best.oblique_feats[1] as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+            ^ ((node_indices.len() as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+        if let Some(audit_half) = honest_fixed_split_gain_twofold(
+            binned,
+            gradients,
+            hessians,
+            node_indices,
+            g_sum,
+            h_sum,
+            &best,
+            lambda_reg,
+            0.0,
+            min_h,
+            audit_seed,
+        ) {
+            let audit_gain = 2.0 * audit_half;
+            if audit_gain.is_finite() && audit_gain > 0.0 {
+                best.gain = 0.45 * best.gain + 0.55 * audit_gain;
+            } else {
+                return SplitResult::empty();
+            }
+        } else {
+            return SplitResult::empty();
         }
     }
 
@@ -5085,10 +7138,8 @@ pub(super) fn find_extra_trees_split(
         }
 
         let col_bins = binned.col_bins(feat);
-        for i in 0..feat_n_bins {
-            g_hist[i] = 0.0;
-            h_hist[i] = 0.0;
-        }
+        g_hist[..feat_n_bins].fill(0.0);
+        h_hist[..feat_n_bins].fill(0.0);
 
         let mut g_miss = 0.0f64;
         let mut h_miss = 0.0f64;
@@ -5578,8 +7629,22 @@ pub(super) fn find_best_split_from_hists_debiased(
     complement_debias_mode: u8,
 ) -> SplitResult {
     let max_bins = hists.max_bins;
-    let feat_to_idx =
-        |feat: usize| -> Option<usize> { tree_features.iter().position(|&f| f == feat) };
+    let feat_to_idx_vec: Vec<u32> = {
+        let mut v = vec![u32::MAX; binned.n_features];
+        for (pos, &f) in tree_features.iter().enumerate() {
+            if f < v.len() {
+                v[f] = pos as u32;
+            }
+        }
+        v
+    };
+    let feat_to_idx = |feat: usize| -> Option<usize> {
+        feat_to_idx_vec
+            .get(feat)
+            .copied()
+            .filter(|&v| v != u32::MAX)
+            .map(|v| v as usize)
+    };
     let empty_split = SplitResult::empty;
 
     let eval_one = |feat: usize| -> SplitResult {
@@ -5811,6 +7876,9 @@ pub(super) fn find_best_split_from_hists(
     tree_features: &[usize],
     active_features: &[usize],
     binned: &BinnedData,
+    gradients: Option<&[f64]>,
+    hessians: Option<&[f64]>,
+    node_indices: Option<&[u32]>,
     g_sum: f64,
     h_sum: f64,
     lambda_reg: f64,
@@ -5823,13 +7891,36 @@ pub(super) fn find_best_split_from_hists(
     monotone_constraints: &[i8],
     gain_penalty: f64,
     interval_splits: bool,
+    feature_prior: Option<&[f64]>,
 ) -> SplitResult {
+    // consensus prior: features compete on gain * prior (raw gains preserved in
+    // the returned SplitResult; prior only steers the cross-feature argmax)
+    let prior_of = |feat: usize| -> f64 {
+        feature_prior
+            .and_then(|p| p.get(feat).copied())
+            .unwrap_or(1.0)
+    };
     let max_bins = hists.max_bins;
 
-    // Build a lookup from global feature id -> index in tree_features
-    // (needed to find the right histogram slice)
-    let feat_to_idx =
-        |feat: usize| -> Option<usize> { tree_features.iter().position(|&f| f == feat) };
+    // Build a direct feat-id → tree_features-position table once, indexed by
+    // global feature id, so the per-feature lookup in the par_iter body is O(1)
+    // instead of an O(tree_features.len()) linear scan repeated per active feat.
+    let feat_to_idx_vec: Vec<u32> = {
+        let mut v = vec![u32::MAX; binned.n_features];
+        for (pos, &f) in tree_features.iter().enumerate() {
+            if f < v.len() {
+                v[f] = pos as u32;
+            }
+        }
+        v
+    };
+    let feat_to_idx = |feat: usize| -> Option<usize> {
+        feat_to_idx_vec
+            .get(feat)
+            .copied()
+            .filter(|&v| v != u32::MAX)
+            .map(|v| v as usize)
+    };
 
     let empty_split = SplitResult::empty;
 
@@ -5866,13 +7957,38 @@ pub(super) fn find_best_split_from_hists(
                         gain_penalty,
                         interval_splits,
                     );
-                    if r.gain > best.gain {
+                    let r = if let (Some(g), Some(h), Some(idx)) =
+                        (gradients, hessians, node_indices)
+                    {
+                        selection_audited_split(
+                            r,
+                            binned,
+                            g,
+                            h,
+                            idx,
+                            g_sum,
+                            h_sum,
+                            lambda_reg,
+                            l1_reg,
+                            min_h,
+                            noise_seed ^ ((feat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                        )
+                    } else {
+                        r
+                    };
+                    if r.gain * prior_of(r.feat) > best.gain * prior_of(best.feat) {
                         best = r;
                     }
                 }
                 best
             })
-            .reduce(empty_split, |a, b| if b.gain > a.gain { b } else { a })
+            .reduce(empty_split, |a, b| {
+                if b.gain * prior_of(b.feat) > a.gain * prior_of(a.feat) {
+                    b
+                } else {
+                    a
+                }
+            })
     } else {
         let mut best = empty_split();
         for &feat in active_features {
@@ -5905,7 +8021,24 @@ pub(super) fn find_best_split_from_hists(
                     gain_penalty,
                     interval_splits,
                 );
-                if r.gain > best.gain {
+                let r = if let (Some(g), Some(h), Some(idx)) = (gradients, hessians, node_indices) {
+                    selection_audited_split(
+                        r,
+                        binned,
+                        g,
+                        h,
+                        idx,
+                        g_sum,
+                        h_sum,
+                        lambda_reg,
+                        l1_reg,
+                        min_h,
+                        noise_seed ^ ((feat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                    )
+                } else {
+                    r
+                };
+                if r.gain * prior_of(r.feat) > best.gain * prior_of(best.feat) {
                     best = r;
                 }
             }
@@ -6016,12 +8149,12 @@ pub(super) fn eval_cat_pair_jit_for_node(
             let other_g = g_nm - cum_g;
             let other_h = h_nm - cum_h;
             if cum_h >= min_h && other_h >= min_h {
-                let gain = 0.5
+                let mut gain = 0.5
                     * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
                         + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
                         - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
                     - gamma;
-                let gain = evidence_adjusted_gain(
+                gain = evidence_adjusted_gain(
                     binned,
                     gain,
                     cum_h,
@@ -6123,12 +8256,12 @@ pub(super) fn eval_cat_pair_jit_for_node(
                 let lg = cum_g + g_miss;
                 let lh = cum_h + h_miss;
                 if lh >= min_h && other_h >= min_h {
-                    let gain = 0.5
+                    let mut gain = 0.5
                         * (l1_gain_score(lg, lh, lambda_reg, l1_reg)
                             + l1_gain_score(other_g, other_h, lambda_reg, l1_reg)
                             - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
                         - gamma;
-                    let gain = evidence_adjusted_gain(
+                    gain = evidence_adjusted_gain(
                         binned,
                         gain,
                         lh,
@@ -6146,12 +8279,12 @@ pub(super) fn eval_cat_pair_jit_for_node(
                 let rg = other_g + g_miss;
                 let rh = other_h + h_miss;
                 if cum_h >= min_h && rh >= min_h {
-                    let gain = 0.5
+                    let mut gain = 0.5
                         * (l1_gain_score(cum_g, cum_h, lambda_reg, l1_reg)
                             + l1_gain_score(rg, rh, lambda_reg, l1_reg)
                             - l1_gain_score(g_sum, h_sum, lambda_reg, l1_reg))
                         - gamma;
-                    let gain = evidence_adjusted_gain(
+                    gain = evidence_adjusted_gain(
                         binned,
                         gain,
                         cum_h,
@@ -6170,25 +8303,12 @@ pub(super) fn eval_cat_pair_jit_for_node(
             if !best_gain.is_finite() {
                 continue;
             }
-            // Strict margin vs raw best; also must beat any prior pair best.
-            let raw_threshold = if raw_best_gain.is_finite() && raw_best_gain > 0.0 {
-                raw_best_gain * cfg.gain_margin
-            } else {
-                0.0
-            };
-            if best_gain <= raw_threshold {
-                continue;
-            }
-            if best_gain <= best_pair.gain {
-                continue;
-            }
-
             let mut mask: u64 = 0;
             for idx2 in 0..=best_split_idx {
                 let c = order[idx2];
                 mask |= 1u64 << c;
             }
-            best_pair = SplitResult::cat_pair(
+            let mut candidate = SplitResult::cat_pair(
                 best_gain,
                 f1,
                 f2 as u32,
@@ -6198,6 +8318,1165 @@ pub(super) fn eval_cat_pair_jit_for_node(
                 cfg.k_buckets,
                 best_missing_left,
             );
+
+            // Winner-audit the adaptive pair search. Pair buckets and their
+            // ordering are learned from gradients, so raw in-node gain has a
+            // large winner's curse. A two-fold fixed-split pseudo-gain asks if
+            // the selected pair's child predictions reduce Taylor loss on rows
+            // not used to fit those child predictions. The audit gain is
+            // approximately half-node scale, so double it before blending.
+            let audit_seed = ((f1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                ^ ((f2 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                ^ ((depth as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+            let Some(audit_gain_half) = honest_fixed_split_gain_twofold(
+                binned,
+                gradients,
+                hessians,
+                node_indices,
+                g_sum,
+                h_sum,
+                &candidate,
+                lambda_reg,
+                l1_reg,
+                min_h,
+                audit_seed,
+            ) else {
+                continue;
+            };
+            let audit_gain = 2.0 * audit_gain_half;
+            if !audit_gain.is_finite() || audit_gain <= 0.0 {
+                continue;
+            }
+            candidate.gain = 0.45 * best_gain + 0.55 * audit_gain;
+
+            // Strict margin vs raw best; also must beat any prior pair best.
+            let raw_threshold = if raw_best_gain.is_finite() && raw_best_gain > 0.0 {
+                raw_best_gain * cfg.gain_margin
+            } else {
+                0.0
+            };
+            if candidate.gain <= raw_threshold {
+                continue;
+            }
+            if candidate.gain <= best_pair.gain {
+                continue;
+            }
+            best_pair = candidate;
+        }
+    }
+    best_pair
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_cat_pair_multi_gain_fold(
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    all_probs: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    node_indices: &[u32],
+    lambda_reg: f64,
+    gamma: f64,
+    min_h: f64,
+    gain_penalty: f64,
+    use_coupled_gain: bool,
+    fold: u8,
+    n_cutpoints: usize,
+    split: &SplitResult,
+) -> Option<f64> {
+    let mut parent_g = vec![0.0f64; n_classes];
+    let mut parent_h = vec![0.0f64; n_classes];
+    let mut left_g = vec![0.0f64; n_classes];
+    let mut left_h = vec![0.0f64; n_classes];
+    let mut parent_p = if use_coupled_gain {
+        vec![0.0f64; n_classes]
+    } else {
+        Vec::new()
+    };
+    let mut left_p = if use_coupled_gain {
+        vec![0.0f64; n_classes]
+    } else {
+        Vec::new()
+    };
+    let mut parent_pp = if use_coupled_gain {
+        vec![0.0f64; n_classes * n_classes]
+    } else {
+        Vec::new()
+    };
+    let mut left_pp = if use_coupled_gain {
+        vec![0.0f64; n_classes * n_classes]
+    } else {
+        Vec::new()
+    };
+
+    let mut used_rows = 0usize;
+    for &idx in node_indices {
+        let row = idx as usize;
+        let h = (row as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(17)
+            ^ 0xBF58_476D_1CE4_E5B9;
+        if ((h >> 63) as u8) != (fold & 1) {
+            continue;
+        }
+        used_rows += 1;
+        let goes_left = split_goes_left_binned(split, binned, row);
+        let prob_base = row * n_classes;
+        for cls in 0..n_classes {
+            let off = cls * n_rows + row;
+            let g = all_gradients[off];
+            let hess = all_hessians[off];
+            parent_g[cls] += g;
+            parent_h[cls] += hess;
+            if goes_left {
+                left_g[cls] += g;
+                left_h[cls] += hess;
+            }
+            if use_coupled_gain {
+                parent_p[cls] += all_probs[prob_base + cls];
+                if goes_left {
+                    left_p[cls] += all_probs[prob_base + cls];
+                }
+            }
+        }
+        if use_coupled_gain {
+            for a in 0..n_classes {
+                let pa = all_probs[prob_base + a];
+                let row_base = a * n_classes;
+                for b in 0..n_classes {
+                    let pp = pa * all_probs[prob_base + b];
+                    parent_pp[row_base + b] += pp;
+                    if goes_left {
+                        left_pp[row_base + b] += pp;
+                    }
+                }
+            }
+        }
+    }
+    if used_rows < 2 {
+        return None;
+    }
+
+    let parent_total_h: f64 = parent_h.iter().sum();
+    let left_total_h: f64 = left_h.iter().sum();
+    let right_total_h = parent_total_h - left_total_h;
+    if left_total_h < min_h || right_total_h < min_h {
+        return None;
+    }
+
+    let mut right_g = vec![0.0f64; n_classes];
+    let mut gain = if use_coupled_gain {
+        let mut right_p = vec![0.0f64; n_classes];
+        let mut right_pp = vec![0.0f64; n_classes * n_classes];
+        for cls in 0..n_classes {
+            right_g[cls] = parent_g[cls] - left_g[cls];
+            right_p[cls] = parent_p[cls] - left_p[cls];
+        }
+        for kk in 0..(n_classes * n_classes) {
+            right_pp[kk] = parent_pp[kk] - left_pp[kk];
+        }
+        let mut dense_a = vec![0.0f64; n_classes * n_classes];
+        let mut dense_rhs = vec![0.0f64; n_classes];
+        let parent_obj = dense_multiclass_gain(
+            &parent_g,
+            &parent_p,
+            &parent_pp,
+            lambda_reg,
+            &mut dense_a,
+            &mut dense_rhs,
+        );
+        let left_obj = dense_multiclass_gain(
+            &left_g,
+            &left_p,
+            &left_pp,
+            lambda_reg,
+            &mut dense_a,
+            &mut dense_rhs,
+        );
+        let right_obj = dense_multiclass_gain(
+            &right_g,
+            &right_p,
+            &right_pp,
+            lambda_reg,
+            &mut dense_a,
+            &mut dense_rhs,
+        );
+        0.5 * (left_obj + right_obj - parent_obj) - gamma
+    } else {
+        let mut parent_obj = 0.0f64;
+        let mut child_obj = 0.0f64;
+        for cls in 0..n_classes {
+            let rh = parent_h[cls] - left_h[cls];
+            right_g[cls] = parent_g[cls] - left_g[cls];
+            parent_obj += parent_g[cls] * parent_g[cls] / (parent_h[cls] + lambda_reg);
+            child_obj += left_g[cls] * left_g[cls] / (left_h[cls] + lambda_reg)
+                + right_g[cls] * right_g[cls] / (rh + lambda_reg);
+        }
+        0.5 * (child_obj - parent_obj) - gamma
+    };
+
+    if gain_penalty > 0.0 {
+        let mut pen = 0.0f64;
+        for cls in 0..n_classes {
+            let rh = parent_h[cls] - left_h[cls];
+            pen += 1.0 / (left_h[cls] + lambda_reg) + 1.0 / (rh + lambda_reg)
+                - 1.0 / (parent_h[cls] + lambda_reg);
+        }
+        gain -= gain_penalty * 0.5 * pen;
+    }
+    gain = evidence_adjusted_gain(
+        binned,
+        gain,
+        left_total_h,
+        right_total_h,
+        parent_total_h,
+        lambda_reg,
+        n_cutpoints,
+    );
+    gain = categorical_audit_adjusted_gain(
+        binned,
+        gain,
+        left_total_h,
+        right_total_h,
+        parent_total_h,
+        lambda_reg,
+        n_cutpoints,
+    );
+    gain.is_finite().then_some(gain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn honest_cat_pair_multi_gain(
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    all_probs: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    node_indices: &[u32],
+    lambda_reg: f64,
+    gamma: f64,
+    min_h: f64,
+    gain_penalty: f64,
+    use_coupled_gain: bool,
+    n_cutpoints: usize,
+    full_gain: f64,
+    raw_threshold: f64,
+    split: &SplitResult,
+) -> Option<f64> {
+    let g0 = fixed_cat_pair_multi_gain_fold(
+        binned,
+        all_gradients,
+        all_hessians,
+        all_probs,
+        n_classes,
+        n_rows,
+        node_indices,
+        lambda_reg,
+        gamma,
+        min_h,
+        gain_penalty,
+        use_coupled_gain,
+        0,
+        n_cutpoints,
+        split,
+    )?;
+    let g1 = fixed_cat_pair_multi_gain_fold(
+        binned,
+        all_gradients,
+        all_hessians,
+        all_probs,
+        n_classes,
+        n_rows,
+        node_indices,
+        lambda_reg,
+        gamma,
+        min_h,
+        gain_penalty,
+        use_coupled_gain,
+        1,
+        n_cutpoints,
+        split,
+    )?;
+    if g0 <= 0.0 || g1 <= 0.0 {
+        return None;
+    }
+    let honest_gain = 2.0 * g0.min(g1);
+    let audited_gain = full_gain.min(honest_gain);
+    (audited_gain.is_finite() && audited_gain > raw_threshold).then_some(audited_gain)
+}
+
+/// Multiclass variant of JIT-CatPairSplit for shared-structure trees.
+///
+/// Each categorical feature is first compressed into a few residual-contrast
+/// buckets.  Pair cells are then scored by the same multiclass Newton objective
+/// used for ordinary shared splits.  The candidate only wins if it clears the
+/// existing cat-pair gain margin, so it behaves as a sparse interaction rescue
+/// instead of replacing the normal split search.
+pub(super) fn eval_cat_pair_jit_multi_for_node(
+    binned: &BinnedData,
+    all_gradients: &[f64],
+    all_hessians: &[f64],
+    all_probs: &[f64],
+    n_classes: usize,
+    n_rows: usize,
+    node_indices: &[u32],
+    active_features: &[usize],
+    g_sums: &[f64],
+    h_sums: &[f64],
+    lambda_reg: f64,
+    gamma: f64,
+    min_h: f64,
+    cat_smooth: f64,
+    gain_penalty: f64,
+    cat_sort_dir: &[f64],
+    coupled_split_gain: bool,
+    parent_p_sums: &[f64],
+    parent_pp_sums: &[f64],
+    parent_dense_gain: f64,
+    depth: usize,
+    raw_best_gain: f64,
+    cfg: &CatPairConfig,
+) -> SplitResult {
+    if !cfg.enabled
+        || n_classes < 2
+        || depth > cfg.max_node_depth
+        || node_indices.len() < cfg.min_node_rows
+    {
+        return SplitResult::empty();
+    }
+
+    let cat_feats: Vec<usize> = active_features
+        .iter()
+        .copied()
+        .filter(|&f| f < binned.is_categorical.len() && binned.is_categorical[f])
+        .collect();
+    if cat_feats.len() < 2 {
+        return SplitResult::empty();
+    }
+
+    let use_coupled_gain = coupled_split_gain
+        && n_classes >= 3
+        && all_probs.len() >= n_rows * n_classes
+        && parent_p_sums.len() >= n_classes
+        && parent_pp_sums.len() >= n_classes * n_classes;
+
+    let parent_obj_diag: f64 = (0..n_classes)
+        .map(|k| g_sums[k] * g_sums[k] / (h_sums[k] + lambda_reg))
+        .sum();
+    let parent_obj = if use_coupled_gain {
+        parent_dense_gain
+    } else {
+        parent_obj_diag
+    };
+
+    let mut scored: Vec<(usize, f64, Vec<usize>)> = Vec::new();
+    for &f in &cat_feats {
+        let n_bins = binned.n_bins(f);
+        if n_bins < 2 {
+            continue;
+        }
+        let col = binned.col_bins(f);
+        let mut bin_g = vec![0.0f64; n_classes * n_bins];
+        let mut bin_h = vec![0.0f64; n_classes * n_bins];
+        let mut miss_g = vec![0.0f64; n_classes];
+        let mut miss_h = vec![0.0f64; n_classes];
+
+        for &idx in node_indices {
+            let row = idx as usize;
+            let bin = col[row];
+            if bin == MISSING_BIN {
+                for k in 0..n_classes {
+                    let off = k * n_rows + row;
+                    miss_g[k] += all_gradients[off];
+                    miss_h[k] += all_hessians[off];
+                }
+            } else {
+                let bu = bin as usize;
+                for k in 0..n_classes {
+                    let off = k * n_rows + row;
+                    bin_g[k * n_bins + bu] += all_gradients[off];
+                    bin_h[k * n_bins + bu] += all_hessians[off];
+                }
+            }
+        }
+
+        let mut cat_bins = Vec::new();
+        for bin in 0..n_bins {
+            let total_h: f64 = (0..n_classes).map(|k| bin_h[k * n_bins + bin]).sum();
+            if total_h > 0.0 {
+                cat_bins.push(bin);
+            }
+        }
+        if cat_bins.len() < 2 {
+            continue;
+        }
+
+        let total_h_nm: f64 = (0..n_classes).map(|k| h_sums[k] - miss_h[k]).sum();
+        let total_proj_nm: f64 = (0..n_classes)
+            .map(|k| (g_sums[k] - miss_g[k]) * cat_sort_dir.get(k).copied().unwrap_or(0.0))
+            .sum();
+        let node_ratio = if total_h_nm > 1e-10 {
+            total_proj_nm / total_h_nm
+        } else {
+            0.0
+        };
+
+        let mut scores = vec![0.0f64; n_bins];
+        for &bin in &cat_bins {
+            let mut proj_g = 0.0f64;
+            let mut total_h = 0.0f64;
+            for k in 0..n_classes {
+                proj_g += bin_g[k * n_bins + bin] * cat_sort_dir.get(k).copied().unwrap_or(0.0);
+                total_h += bin_h[k * n_bins + bin];
+            }
+            scores[bin] = (proj_g + cat_smooth * node_ratio) / (total_h + cat_smooth);
+        }
+        cat_bins.sort_by(|&a, &b| scores[a].partial_cmp(&scores[b]).unwrap_or(Ordering::Equal));
+
+        let mut cum_g = vec![0.0f64; n_classes];
+        let mut cum_h = vec![0.0f64; n_classes];
+        let mut best = f64::NEG_INFINITY;
+        let search_width = cat_bins.len().saturating_sub(1).max(1);
+        for i in 0..cat_bins.len() - 1 {
+            let bin = cat_bins[i];
+            for k in 0..n_classes {
+                cum_g[k] += bin_g[k * n_bins + bin];
+                cum_h[k] += bin_h[k * n_bins + bin];
+            }
+            for miss_left in [true, false] {
+                let mut obj = 0.0f64;
+                let mut total_lh = 0.0f64;
+                let mut total_rh = 0.0f64;
+                let mut pen = 0.0f64;
+                for k in 0..n_classes {
+                    let g_nm = g_sums[k] - miss_g[k];
+                    let h_nm = h_sums[k] - miss_h[k];
+                    let (lg, lh, rg, rh) = if miss_left {
+                        (
+                            cum_g[k] + miss_g[k],
+                            cum_h[k] + miss_h[k],
+                            g_nm - cum_g[k],
+                            h_nm - cum_h[k],
+                        )
+                    } else {
+                        (
+                            cum_g[k],
+                            cum_h[k],
+                            g_nm - cum_g[k] + miss_g[k],
+                            h_nm - cum_h[k] + miss_h[k],
+                        )
+                    };
+                    obj += lg * lg / (lh + lambda_reg) + rg * rg / (rh + lambda_reg);
+                    total_lh += lh;
+                    total_rh += rh;
+                    if gain_penalty > 0.0 {
+                        pen += 1.0 / (lh + lambda_reg) + 1.0 / (rh + lambda_reg)
+                            - 1.0 / (h_sums[k] + lambda_reg);
+                    }
+                }
+                if total_lh < min_h || total_rh < min_h {
+                    continue;
+                }
+                let mut gain = 0.5 * (obj - parent_obj_diag) - gamma;
+                if gain_penalty > 0.0 {
+                    gain -= gain_penalty * 0.5 * pen;
+                }
+                gain = evidence_adjusted_gain(
+                    binned,
+                    gain,
+                    total_lh,
+                    total_rh,
+                    total_lh + total_rh,
+                    lambda_reg,
+                    search_width,
+                );
+                gain = categorical_audit_adjusted_gain(
+                    binned,
+                    gain,
+                    total_lh,
+                    total_rh,
+                    total_lh + total_rh,
+                    lambda_reg,
+                    search_width,
+                );
+                if gain.is_finite() && gain > best {
+                    best = gain;
+                }
+            }
+        }
+        if best.is_finite() {
+            scored.push((f, best, cat_bins));
+        }
+    }
+    if scored.len() < 2 {
+        return SplitResult::empty();
+    }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let top_n = scored.len().min(cfg.top_k_cat);
+
+    let k = cfg.k_buckets as usize;
+    let cells_total = k * k;
+    if cells_total == 0 || cells_total > 64 {
+        return SplitResult::empty();
+    }
+
+    let mut bucket_maps: Vec<(usize, Vec<u8>)> = Vec::with_capacity(top_n);
+    for (f, _gain, ordered_bins) in scored.iter().take(top_n) {
+        let n_bins = binned.n_bins(*f);
+        let mut map = vec![0u8; n_bins];
+        let n_cats = ordered_bins.len().max(1);
+        for (rank, &bin) in ordered_bins.iter().enumerate() {
+            map[bin] = ((rank * k) / n_cats).min(k - 1) as u8;
+        }
+        bucket_maps.push((*f, map));
+    }
+
+    let raw_threshold = if raw_best_gain.is_finite() && raw_best_gain > 0.0 {
+        raw_best_gain * cfg.gain_margin
+    } else {
+        0.0
+    };
+    let mut best_pair = SplitResult::empty();
+
+    // Low-cardinality rescue: when the two categorical features have only a
+    // handful of native bins, evaluate the exact pair cells instead of forcing
+    // them through residual buckets.  This is the pair analogue of the exact
+    // low-card multiclass subset search above: cheap for 2x3 / 3x3 / 4x4
+    // categoricals, and materially more expressive than sorted single-feature
+    // prefixes.
+    const EXACT_PAIR_MAX_ACTIVE_CELLS: usize = 12;
+    for i in 0..top_n {
+        let f1 = scored[i].0;
+        let n1 = binned.n_bins(f1);
+        if !(2..=EXACT_PAIR_MAX_ACTIVE_CELLS).contains(&n1) {
+            continue;
+        }
+        let col1 = binned.col_bins(f1);
+        for j in (i + 1)..top_n {
+            let f2 = scored[j].0;
+            let n2 = binned.n_bins(f2);
+            let total_cells = match n1.checked_mul(n2) {
+                Some(v) if v <= 64 && v <= EXACT_PAIR_MAX_ACTIVE_CELLS => v,
+                _ => continue,
+            };
+            if n2 > u8::MAX as usize {
+                continue;
+            }
+            let col2 = binned.col_bins(f2);
+            let mut cell_g = vec![0.0f64; total_cells * n_classes];
+            let mut cell_h = vec![0.0f64; total_cells * n_classes];
+            let mut cell_p = if use_coupled_gain {
+                vec![0.0f64; total_cells * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut cell_pp = if use_coupled_gain {
+                vec![0.0f64; total_cells * n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut miss_g = vec![0.0f64; n_classes];
+            let mut miss_h = vec![0.0f64; n_classes];
+            let mut miss_p = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut miss_pp = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+
+            for &idx in node_indices {
+                let row = idx as usize;
+                let b1 = col1[row];
+                let b2 = col2[row];
+                if b1 == MISSING_BIN || b2 == MISSING_BIN {
+                    let prob_base = row * n_classes;
+                    for cls in 0..n_classes {
+                        let off = cls * n_rows + row;
+                        miss_g[cls] += all_gradients[off];
+                        miss_h[cls] += all_hessians[off];
+                        if use_coupled_gain {
+                            miss_p[cls] += all_probs[prob_base + cls];
+                        }
+                    }
+                    if use_coupled_gain {
+                        for a in 0..n_classes {
+                            let pa = all_probs[prob_base + a];
+                            let row_base = a * n_classes;
+                            for b in 0..n_classes {
+                                miss_pp[row_base + b] += pa * all_probs[prob_base + b];
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let b1u = b1 as usize;
+                let b2u = b2 as usize;
+                if b1u >= n1 || b2u >= n2 {
+                    continue;
+                }
+                let cell = b1u * n2 + b2u;
+                let base = cell * n_classes;
+                let prob_base = row * n_classes;
+                for cls in 0..n_classes {
+                    let off = cls * n_rows + row;
+                    cell_g[base + cls] += all_gradients[off];
+                    cell_h[base + cls] += all_hessians[off];
+                    if use_coupled_gain {
+                        cell_p[base + cls] += all_probs[prob_base + cls];
+                    }
+                }
+                if use_coupled_gain {
+                    let pp_base = cell * n_classes * n_classes;
+                    for a in 0..n_classes {
+                        let pa = all_probs[prob_base + a];
+                        let row_base = a * n_classes;
+                        for b in 0..n_classes {
+                            cell_pp[pp_base + row_base + b] += pa * all_probs[prob_base + b];
+                        }
+                    }
+                }
+            }
+
+            let active_cells: Vec<usize> = (0..total_cells)
+                .filter(|&cell| {
+                    let base = cell * n_classes;
+                    (0..n_classes).map(|cls| cell_h[base + cls]).sum::<f64>() > 0.0
+                })
+                .collect();
+            let n_active = active_cells.len();
+            if !(2..=EXACT_PAIR_MAX_ACTIVE_CELLS).contains(&n_active) {
+                continue;
+            }
+            let exact_search_width = (1usize << (n_active - 1)).saturating_sub(1).max(1);
+            let mut best_gain = f64::NEG_INFINITY;
+            let mut best_mask = 0u64;
+            let mut best_missing_left = true;
+            let mut left_p = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut left_pp = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_g_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_g_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_p_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_p_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_pp_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_pp_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut dense_a = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut dense_rhs = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+
+            for subset in 1usize..(1usize << (n_active - 1)) {
+                let mut left_g = vec![0.0f64; n_classes];
+                let mut left_h = vec![0.0f64; n_classes];
+                if use_coupled_gain {
+                    left_p.fill(0.0);
+                    left_pp.fill(0.0);
+                }
+                let mut mask = 0u64;
+                for (pos, &cell) in active_cells.iter().enumerate() {
+                    if ((subset >> pos) & 1) == 0 {
+                        continue;
+                    }
+                    mask |= 1u64 << cell;
+                    let base = cell * n_classes;
+                    for cls in 0..n_classes {
+                        left_g[cls] += cell_g[base + cls];
+                        left_h[cls] += cell_h[base + cls];
+                        if use_coupled_gain {
+                            left_p[cls] += cell_p[base + cls];
+                        }
+                    }
+                    if use_coupled_gain {
+                        let pp_base = cell * n_classes * n_classes;
+                        for kk in 0..(n_classes * n_classes) {
+                            left_pp[kk] += cell_pp[pp_base + kk];
+                        }
+                    }
+                }
+                if mask == 0 {
+                    continue;
+                }
+
+                for miss_left in [true, false] {
+                    let mut obj = 0.0f64;
+                    let mut total_lh = 0.0f64;
+                    let mut total_rh = 0.0f64;
+                    let mut pen = 0.0f64;
+                    for cls in 0..n_classes {
+                        let g_nm = g_sums[cls] - miss_g[cls];
+                        let h_nm = h_sums[cls] - miss_h[cls];
+                        let (lg, lh, rg, rh) = if miss_left {
+                            (
+                                left_g[cls] + miss_g[cls],
+                                left_h[cls] + miss_h[cls],
+                                g_nm - left_g[cls],
+                                h_nm - left_h[cls],
+                            )
+                        } else {
+                            (
+                                left_g[cls],
+                                left_h[cls],
+                                g_nm - left_g[cls] + miss_g[cls],
+                                h_nm - left_h[cls] + miss_h[cls],
+                            )
+                        };
+                        if use_coupled_gain {
+                            l_g_eval[cls] = lg;
+                            r_g_eval[cls] = rg;
+                        } else {
+                            obj += lg * lg / (lh + lambda_reg) + rg * rg / (rh + lambda_reg);
+                        }
+                        total_lh += lh;
+                        total_rh += rh;
+                        if gain_penalty > 0.0 {
+                            pen += 1.0 / (lh + lambda_reg) + 1.0 / (rh + lambda_reg)
+                                - 1.0 / (h_sums[cls] + lambda_reg);
+                        }
+                    }
+                    if total_lh < min_h || total_rh < min_h {
+                        continue;
+                    }
+                    let mut gain = if use_coupled_gain {
+                        for cls in 0..n_classes {
+                            l_p_eval[cls] = if miss_left {
+                                left_p[cls] + miss_p[cls]
+                            } else {
+                                left_p[cls]
+                            };
+                            r_p_eval[cls] = parent_p_sums[cls] - l_p_eval[cls];
+                        }
+                        for kk in 0..(n_classes * n_classes) {
+                            l_pp_eval[kk] = if miss_left {
+                                left_pp[kk] + miss_pp[kk]
+                            } else {
+                                left_pp[kk]
+                            };
+                            r_pp_eval[kk] = parent_pp_sums[kk] - l_pp_eval[kk];
+                        }
+                        let left_obj = dense_multiclass_gain(
+                            &l_g_eval,
+                            &l_p_eval,
+                            &l_pp_eval,
+                            lambda_reg,
+                            &mut dense_a,
+                            &mut dense_rhs,
+                        );
+                        let right_obj = dense_multiclass_gain(
+                            &r_g_eval,
+                            &r_p_eval,
+                            &r_pp_eval,
+                            lambda_reg,
+                            &mut dense_a,
+                            &mut dense_rhs,
+                        );
+                        0.5 * (left_obj + right_obj - parent_obj) - gamma
+                    } else {
+                        0.5 * (obj - parent_obj) - gamma
+                    };
+                    if gain_penalty > 0.0 {
+                        gain -= gain_penalty * 0.5 * pen;
+                    }
+                    gain = evidence_adjusted_gain(
+                        binned,
+                        gain,
+                        total_lh,
+                        total_rh,
+                        total_lh + total_rh,
+                        lambda_reg,
+                        exact_search_width,
+                    );
+                    gain = categorical_audit_adjusted_gain(
+                        binned,
+                        gain,
+                        total_lh,
+                        total_rh,
+                        total_lh + total_rh,
+                        lambda_reg,
+                        exact_search_width,
+                    );
+                    if gain.is_finite() && gain > best_gain {
+                        best_gain = gain;
+                        best_mask = mask;
+                        best_missing_left = miss_left;
+                    }
+                }
+            }
+
+            if best_gain.is_finite() && best_gain > raw_threshold && best_gain > best_pair.gain {
+                let map_a: Vec<u8> = (0..n1).map(|v| v as u8).collect();
+                let map_b: Vec<u8> = (0..n2).map(|v| v as u8).collect();
+                let mut candidate = SplitResult::cat_pair(
+                    best_gain,
+                    f1,
+                    f2 as u32,
+                    map_a,
+                    map_b,
+                    best_mask,
+                    n2 as u8,
+                    best_missing_left,
+                );
+                if candidate.gain > best_pair.gain {
+                    best_pair = candidate;
+                }
+            }
+        }
+    }
+
+    for i in 0..bucket_maps.len() {
+        for j in (i + 1)..bucket_maps.len() {
+            let (f1, ref map_a) = bucket_maps[i];
+            let (f2, ref map_b) = bucket_maps[j];
+            let col1 = binned.col_bins(f1);
+            let col2 = binned.col_bins(f2);
+            let mut cell_g = vec![0.0f64; cells_total * n_classes];
+            let mut cell_h = vec![0.0f64; cells_total * n_classes];
+            let mut cell_p = if use_coupled_gain {
+                vec![0.0f64; cells_total * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut cell_pp = if use_coupled_gain {
+                vec![0.0f64; cells_total * n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut miss_g = vec![0.0f64; n_classes];
+            let mut miss_h = vec![0.0f64; n_classes];
+            let mut miss_p = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut miss_pp = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+
+            for &idx in node_indices {
+                let row = idx as usize;
+                let b1 = col1[row];
+                let b2 = col2[row];
+                if b1 == MISSING_BIN || b2 == MISSING_BIN {
+                    let prob_base = row * n_classes;
+                    for cls in 0..n_classes {
+                        let off = cls * n_rows + row;
+                        miss_g[cls] += all_gradients[off];
+                        miss_h[cls] += all_hessians[off];
+                        if use_coupled_gain {
+                            miss_p[cls] += all_probs[prob_base + cls];
+                        }
+                    }
+                    if use_coupled_gain {
+                        for a in 0..n_classes {
+                            let pa = all_probs[prob_base + a];
+                            let row_base = a * n_classes;
+                            for b in 0..n_classes {
+                                miss_pp[row_base + b] += pa * all_probs[prob_base + b];
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let cell = map_a[b1 as usize] as usize * k + map_b[b2 as usize] as usize;
+                let base = cell * n_classes;
+                let prob_base = row * n_classes;
+                for cls in 0..n_classes {
+                    let off = cls * n_rows + row;
+                    cell_g[base + cls] += all_gradients[off];
+                    cell_h[base + cls] += all_hessians[off];
+                    if use_coupled_gain {
+                        cell_p[base + cls] += all_probs[prob_base + cls];
+                    }
+                }
+                if use_coupled_gain {
+                    let pp_base = cell * n_classes * n_classes;
+                    for a in 0..n_classes {
+                        let pa = all_probs[prob_base + a];
+                        let row_base = a * n_classes;
+                        for b in 0..n_classes {
+                            cell_pp[pp_base + row_base + b] += pa * all_probs[prob_base + b];
+                        }
+                    }
+                }
+            }
+
+            let total_h_nm: f64 = (0..n_classes).map(|cls| h_sums[cls] - miss_h[cls]).sum();
+            let total_proj_nm: f64 = (0..n_classes)
+                .map(|cls| {
+                    (g_sums[cls] - miss_g[cls]) * cat_sort_dir.get(cls).copied().unwrap_or(0.0)
+                })
+                .sum();
+            let node_ratio = if total_h_nm > 1e-10 {
+                total_proj_nm / total_h_nm
+            } else {
+                0.0
+            };
+
+            let mut order: Vec<usize> = (0..cells_total)
+                .filter(|&cell| {
+                    let base = cell * n_classes;
+                    (0..n_classes).map(|cls| cell_h[base + cls]).sum::<f64>() > 0.0
+                })
+                .collect();
+            if order.len() < 2 {
+                continue;
+            }
+            order.sort_by(|&a, &b| {
+                let score = |cell: usize| {
+                    let base = cell * n_classes;
+                    let mut proj_g = 0.0f64;
+                    let mut total_h = 0.0f64;
+                    for cls in 0..n_classes {
+                        proj_g +=
+                            cell_g[base + cls] * cat_sort_dir.get(cls).copied().unwrap_or(0.0);
+                        total_h += cell_h[base + cls];
+                    }
+                    (proj_g + cat_smooth * node_ratio) / (total_h + cat_smooth)
+                };
+                score(a).partial_cmp(&score(b)).unwrap_or(Ordering::Equal)
+            });
+
+            let mut cum_g = vec![0.0f64; n_classes];
+            let mut cum_h = vec![0.0f64; n_classes];
+            let mut cum_p = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut cum_pp = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_g_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_g_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_p_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_p_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut l_pp_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut r_pp_eval = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut dense_a = if use_coupled_gain {
+                vec![0.0f64; n_classes * n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut dense_rhs = if use_coupled_gain {
+                vec![0.0f64; n_classes]
+            } else {
+                Vec::new()
+            };
+            let mut best_gain = f64::NEG_INFINITY;
+            let mut best_split_idx = 0usize;
+            let mut best_missing_left = true;
+            let pair_search_width = order.len().saturating_sub(1).max(1);
+            for oi in 0..order.len() - 1 {
+                let cell = order[oi];
+                let base = cell * n_classes;
+                for cls in 0..n_classes {
+                    cum_g[cls] += cell_g[base + cls];
+                    cum_h[cls] += cell_h[base + cls];
+                    if use_coupled_gain {
+                        cum_p[cls] += cell_p[base + cls];
+                    }
+                }
+                if use_coupled_gain {
+                    let pp_base = cell * n_classes * n_classes;
+                    for kk in 0..(n_classes * n_classes) {
+                        cum_pp[kk] += cell_pp[pp_base + kk];
+                    }
+                }
+                for miss_left in [true, false] {
+                    let mut obj = 0.0f64;
+                    let mut total_lh = 0.0f64;
+                    let mut total_rh = 0.0f64;
+                    let mut pen = 0.0f64;
+                    for cls in 0..n_classes {
+                        let g_nm = g_sums[cls] - miss_g[cls];
+                        let h_nm = h_sums[cls] - miss_h[cls];
+                        let (lg, lh, rg, rh) = if miss_left {
+                            (
+                                cum_g[cls] + miss_g[cls],
+                                cum_h[cls] + miss_h[cls],
+                                g_nm - cum_g[cls],
+                                h_nm - cum_h[cls],
+                            )
+                        } else {
+                            (
+                                cum_g[cls],
+                                cum_h[cls],
+                                g_nm - cum_g[cls] + miss_g[cls],
+                                h_nm - cum_h[cls] + miss_h[cls],
+                            )
+                        };
+                        if use_coupled_gain {
+                            l_g_eval[cls] = lg;
+                            r_g_eval[cls] = rg;
+                        } else {
+                            obj += lg * lg / (lh + lambda_reg) + rg * rg / (rh + lambda_reg);
+                        }
+                        total_lh += lh;
+                        total_rh += rh;
+                        if gain_penalty > 0.0 {
+                            pen += 1.0 / (lh + lambda_reg) + 1.0 / (rh + lambda_reg)
+                                - 1.0 / (h_sums[cls] + lambda_reg);
+                        }
+                    }
+                    if total_lh < min_h || total_rh < min_h {
+                        continue;
+                    }
+                    let mut gain = if use_coupled_gain {
+                        for cls in 0..n_classes {
+                            l_p_eval[cls] = if miss_left {
+                                cum_p[cls] + miss_p[cls]
+                            } else {
+                                cum_p[cls]
+                            };
+                            r_p_eval[cls] = parent_p_sums[cls] - l_p_eval[cls];
+                        }
+                        for kk in 0..(n_classes * n_classes) {
+                            l_pp_eval[kk] = if miss_left {
+                                cum_pp[kk] + miss_pp[kk]
+                            } else {
+                                cum_pp[kk]
+                            };
+                            r_pp_eval[kk] = parent_pp_sums[kk] - l_pp_eval[kk];
+                        }
+                        let left_obj = dense_multiclass_gain(
+                            &l_g_eval,
+                            &l_p_eval,
+                            &l_pp_eval,
+                            lambda_reg,
+                            &mut dense_a,
+                            &mut dense_rhs,
+                        );
+                        let right_obj = dense_multiclass_gain(
+                            &r_g_eval,
+                            &r_p_eval,
+                            &r_pp_eval,
+                            lambda_reg,
+                            &mut dense_a,
+                            &mut dense_rhs,
+                        );
+                        0.5 * (left_obj + right_obj - parent_obj) - gamma
+                    } else {
+                        0.5 * (obj - parent_obj) - gamma
+                    };
+                    if gain_penalty > 0.0 {
+                        gain -= gain_penalty * 0.5 * pen;
+                    }
+                    gain = evidence_adjusted_gain(
+                        binned,
+                        gain,
+                        total_lh,
+                        total_rh,
+                        total_lh + total_rh,
+                        lambda_reg,
+                        pair_search_width,
+                    );
+                    gain = categorical_audit_adjusted_gain(
+                        binned,
+                        gain,
+                        total_lh,
+                        total_rh,
+                        total_lh + total_rh,
+                        lambda_reg,
+                        pair_search_width,
+                    );
+                    if gain.is_finite() && gain > best_gain {
+                        best_gain = gain;
+                        best_split_idx = oi;
+                        best_missing_left = miss_left;
+                    }
+                }
+            }
+
+            if !best_gain.is_finite() || best_gain <= raw_threshold || best_gain <= best_pair.gain {
+                continue;
+            }
+            let mut mask = 0u64;
+            for oi in 0..=best_split_idx {
+                mask |= 1u64 << order[oi];
+            }
+            let mut candidate = SplitResult::cat_pair(
+                best_gain,
+                f1,
+                f2 as u32,
+                map_a.clone(),
+                map_b.clone(),
+                mask,
+                cfg.k_buckets,
+                best_missing_left,
+            );
+            if candidate.gain > best_pair.gain {
+                best_pair = candidate;
+            }
         }
     }
     best_pair
@@ -6340,6 +9619,19 @@ pub(super) fn find_best_split(
                         gain_penalty,
                         interval_splits,
                     );
+                    let r = selection_audited_split(
+                        r,
+                        binned,
+                        gradients,
+                        hessians,
+                        node_indices,
+                        g_sum,
+                        h_sum,
+                        lambda_reg,
+                        l1_reg,
+                        min_h,
+                        noise_seed ^ ((feat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                    );
                     if r.gain > best.gain {
                         best = r;
                     }
@@ -6378,6 +9670,19 @@ pub(super) fn find_best_split(
                 gain_penalty,
                 interval_splits,
             );
+            let r = selection_audited_split(
+                r,
+                binned,
+                gradients,
+                hessians,
+                node_indices,
+                g_sum,
+                h_sum,
+                lambda_reg,
+                l1_reg,
+                min_h,
+                noise_seed ^ ((feat as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            );
             if r.gain > best.gain {
                 best = r;
             }
@@ -6414,6 +9719,8 @@ pub(super) fn find_best_split_multi(
     cat_smooth: f64,
     gain_penalty: f64,
     coupled_split_gain: bool,
+    cat_pair_cfg: &CatPairConfig,
+    depth: usize,
 ) -> SplitResult {
     let work = active_features.len() * node_indices.len();
     let max_bins = g_hists.len() / n_classes;
@@ -6452,7 +9759,8 @@ pub(super) fn find_best_split_multi(
         multiclass_cat_sort_direction(g_sums, h_sums, lambda_reg)
     };
 
-    if !use_coupled_gain && work >= PAR_SPLIT_THRESHOLD && active_features.len() >= 4 {
+    let raw_best = if !use_coupled_gain && work >= PAR_SPLIT_THRESHOLD && active_features.len() >= 4
+    {
         let empty_split = SplitResult::empty;
         active_features
             .par_iter()
@@ -6547,6 +9855,52 @@ pub(super) fn find_best_split_multi(
             }
         }
         best
+    };
+    let raw_best = selection_audited_split_multi(
+        raw_best,
+        binned,
+        all_gradients,
+        all_hessians,
+        n_classes,
+        n_rows,
+        node_indices,
+        lambda_reg,
+        min_h,
+        noise_seed ^ ((depth as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+    );
+
+    if !cat_pair_cfg.enabled {
+        return raw_best;
+    }
+    let pair = eval_cat_pair_jit_multi_for_node(
+        binned,
+        all_gradients,
+        all_hessians,
+        all_probs,
+        n_classes,
+        n_rows,
+        node_indices,
+        active_features,
+        g_sums,
+        h_sums,
+        lambda_reg,
+        gamma,
+        min_h,
+        cat_smooth,
+        gain_penalty,
+        &cat_sort_dir,
+        use_coupled_gain,
+        &parent_p_sums,
+        &parent_pp_sums,
+        parent_dense_gain,
+        depth,
+        raw_best.gain,
+        cat_pair_cfg,
+    );
+    if pair.gain > raw_best.gain {
+        pair
+    } else {
+        raw_best
     }
 }
 

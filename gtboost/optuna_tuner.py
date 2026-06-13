@@ -39,6 +39,9 @@ def tune_optuna(
         "early_stopping_rounds",
         "categorical_geometry_choices",
         "interval_splits",
+        "operator_mode",
+        "robust_selection",
+        "robust_z",
     }
     tuner_kwargs = {k: v for k, v in kwargs.items() if k in allowed_kwargs}
     result = tune_gtboost(

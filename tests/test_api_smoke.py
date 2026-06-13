@@ -92,6 +92,72 @@ def test_sklearn_classifier_dataframe_smoke():
     assert np.allclose(proba.sum(axis=1), 1.0)
 
 
+def test_multiclass_pcf_dataframe_smoke():
+    rng = np.random.default_rng(21)
+    n = 150
+    group = np.array(["a", "b", "c", "d", "e"])[rng.integers(0, 5, size=n)]
+    x = rng.normal(size=n)
+    y = ((group == "b").astype(int) + 2 * (group == "d").astype(int) + (x > 0.8).astype(int)) % 3
+    df = pd.DataFrame({"x": x, "group": group})
+
+    clf = GTBoostClassifier(
+        n_estimators=16,
+        learning_rate=0.2,
+        max_depth=2,
+        apx=False,
+        interval_splits=False,
+        categorical_geometry="pcf_lite",
+        pcf_config={
+            "eligibility_gate": False,
+            "max_cat": 1,
+            "max_pairs": 0,
+            "max_triples": 0,
+            "folds": 3,
+            "coordinate_mode": "raw",
+        },
+        seed=21,
+    )
+    clf.fit(df.iloc[:110], y[:110], eval_set=[(df.iloc[110:], y[110:])])
+    proba = clf.predict_proba(df.iloc[110:])
+
+    assert proba.shape == (40, 3)
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    assert clf._model.categorical_geometry_info_["enabled"] is True
+
+
+def test_regression_pcf_dataframe_smoke():
+    rng = np.random.default_rng(22)
+    n = 150
+    city = np.array(["north", "south", "east", "west", "central"])[rng.integers(0, 5, size=n)]
+    x = rng.normal(size=n)
+    y = 2.0 * x + np.where(city == "north", 1.5, 0.0) + np.where(city == "west", -0.8, 0.0)
+    y = y + rng.normal(scale=0.1, size=n)
+    df = pd.DataFrame({"x": x, "city": city})
+
+    reg = GTBoostRegressor(
+        n_estimators=16,
+        learning_rate=0.2,
+        max_depth=2,
+        apx=False,
+        interval_splits=False,
+        categorical_geometry="pcf_lite",
+        pcf_config={
+            "eligibility_gate": False,
+            "max_cat": 1,
+            "max_pairs": 0,
+            "max_triples": 0,
+            "folds": 3,
+        },
+        seed=22,
+    )
+    reg.fit(df.iloc[:110], y[:110], eval_set=[(df.iloc[110:], y[110:])])
+    pred = reg.predict(df.iloc[110:])
+
+    assert pred.shape == (40,)
+    assert np.all(np.isfinite(pred))
+    assert reg._model.categorical_geometry_info_["enabled"] is True
+
+
 def test_verbose_and_eval_attributes_for_sklearn_and_native(capfd):
     df = _binary_frame(90)
     X = df.drop(columns=["target"])
@@ -140,6 +206,59 @@ def test_verbose_and_eval_attributes_for_sklearn_and_native(capfd):
     assert len(booster.evals_result_["validation_0"]["logloss"]) >= 1
 
 
+def test_binary_corrective_block_refit_smoke():
+    df = _binary_frame(140)
+    X = df.drop(columns=["target"])
+    y = df["target"].to_numpy()
+
+    clf = GTBoostClassifier(
+        n_estimators=24,
+        learning_rate=0.12,
+        max_depth=2,
+        apx=False,
+        interval_splits=False,
+        categorical_geometry="raw",
+        corrective_block_refit=True,
+        corrective_blocks=4,
+        corrective_lambda=0.1,
+        corrective_blend=0.5,
+        corrective_audit_fraction=0.2,
+        seed=23,
+    )
+    clf.fit(X.iloc[:100], y[:100], eval_set=[(X.iloc[100:], y[100:])])
+    proba = clf.predict_proba(X.iloc[100:])
+
+    assert proba.shape == (40, 2)
+    assert np.isfinite(proba).all()
+    assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+def test_compiled_apx_tree_weights_smoke():
+    rng = np.random.default_rng(24)
+    X = rng.normal(size=(180, 5))
+    y = 0.8 * X[:, 0] - 0.5 * X[:, 1] + 0.2 * X[:, 2] + rng.normal(scale=0.25, size=180)
+
+    reg = GTBoostRegressor(
+        n_estimators=36,
+        learning_rate=0.12,
+        max_depth=2,
+        apx=False,
+        apx_compile=True,
+        apx_compile_min_rel_improve=-1.0,
+        apx_compile_steps=20,
+        interval_splits=False,
+        seed=24,
+    )
+    reg.fit(X[:130], y[:130], eval_set=[(X[130:], y[130:])])
+    pred = reg.predict(X[130:])
+    weights = reg._model.tree_weights()
+
+    assert pred.shape == (50,)
+    assert np.isfinite(pred).all()
+    assert reg.apx_compile_info_["enabled"] is True
+    assert len(weights) == len(reg._model.tree_info())
+
+
 def test_sklearn_regressor_numpy_smoke():
     rng = np.random.default_rng(5)
     X = rng.normal(size=(70, 3))
@@ -156,6 +275,30 @@ def test_sklearn_regressor_numpy_smoke():
     reg.fit(X[:50], y[:50], eval_set=[(X[50:], y[50:])])
     pred = reg.predict(X[50:])
     assert pred.shape == (20,)
+    assert np.isfinite(pred).all()
+
+
+def test_leafwise_sparse_oblique_path_is_active():
+    rng = np.random.default_rng(44)
+    X = rng.normal(size=(300, 4))
+    y = X[:, 0] + X[:, 1] + rng.normal(scale=0.1, size=300)
+
+    reg = GTBoostRegressor(
+        n_estimators=20,
+        learning_rate=0.2,
+        max_depth=3,
+        grow_policy="leafwise",
+        sparse_oblique_splits=True,
+        interval_splits=False,
+        apx=False,
+        seed=44,
+    )
+    reg.fit(X[:220], y[:220])
+    pred = reg.predict(X[220:])
+    _, _, _, oblique, _ = reg._model.split_op_counts()
+
+    assert oblique > 0
+    assert pred.shape == (80,)
     assert np.isfinite(pred).all()
 
 
@@ -182,8 +325,59 @@ def test_public_tuner_smoke():
 
     assert result.task == "binary"
     assert np.isfinite(result.best_score)
+    assert np.isfinite(result.selection_score)
+    assert result.selection_score >= result.best_score
+    assert isinstance(result.complexity_key, tuple)
     assert result.best_rounds >= 1
     assert result.best_params["n_estimators"] == result.best_rounds
+
+
+def test_classifier_encodes_nonzero_labels():
+    rng = np.random.default_rng(19)
+    X = rng.normal(size=(90, 4))
+    y = np.where(X[:, 0] + 0.3 * X[:, 1] > 0.0, 2, 1)
+
+    clf = GTBoostClassifier(
+        n_estimators=18,
+        learning_rate=0.2,
+        max_depth=2,
+        apx=False,
+        seed=19,
+    )
+    clf.fit(X[:70], y[:70], eval_set=[(X[70:], y[70:])])
+    pred = clf.predict(X[70:])
+    proba = clf.predict_proba(X[70:])
+
+    assert set(clf._classes.tolist()) == {1, 2}
+    assert set(np.unique(pred)).issubset({1, 2})
+    assert proba.shape == (20, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0)
+
+
+def test_classifier_encodes_nonzero_multiclass_labels():
+    rng = np.random.default_rng(20)
+    X = rng.normal(size=(120, 5))
+    cls = np.argmax(
+        np.column_stack([X[:, 0], X[:, 1] - 0.2 * X[:, 2], -X[:, 0] - X[:, 1]]),
+        axis=1,
+    )
+    y = np.asarray([10, 20, 30], dtype=int)[cls]
+
+    clf = GTBoostClassifier(
+        n_estimators=16,
+        learning_rate=0.2,
+        max_depth=2,
+        apx=False,
+        seed=20,
+    )
+    clf.fit(X[:90], y[:90], eval_set=[(X[90:], y[90:])])
+    pred = clf.predict(X[90:])
+    proba = clf.predict_proba(X[90:])
+
+    assert set(clf._classes.tolist()) == {10, 20, 30}
+    assert set(np.unique(pred)).issubset({10, 20, 30})
+    assert proba.shape == (30, 3)
+    assert np.allclose(proba.sum(axis=1), 1.0)
 
 
 def test_interval_prediction_is_reentrant_and_single_row_safe():
@@ -264,6 +458,35 @@ def test_model_save_load_roundtrip(tmp_path):
     assert np.allclose(before, after, atol=1e-12, rtol=1e-12)
 
 
+def test_vertical_init_save_load_roundtrip(tmp_path):
+    rng = np.random.default_rng(31)
+    X = rng.normal(size=(140, 5))
+    y = np.sin(X[:, 0]) + 0.4 * X[:, 2] + rng.normal(scale=0.06, size=140)
+
+    model = gtb.GTBoostModel(
+        task="regression",
+        n_estimators=18,
+        learning_rate=0.12,
+        max_depth=3,
+        num_bins=32,
+        interval_splits=False,
+        vertical_init=True,
+        vertical_init_cycles=2,
+        seed=31,
+    )
+    model.fit(X[:100], y[:100])
+    before = model.predict(X[100:])
+
+    path = tmp_path / "vertical_model.gtboost"
+    model.save_model(path)
+    loaded = gtb.GTBoostModel.load_model(path)
+    after = loaded.predict(X[100:])
+
+    assert before.shape == (40,)
+    assert np.isfinite(before).all()
+    assert np.allclose(before, after, atol=1e-12, rtol=1e-12)
+
+
 def test_pcf_geometry_save_load_roundtrip(tmp_path):
     rng = np.random.default_rng(18)
     n = 180
@@ -333,6 +556,57 @@ def test_training_is_deterministic_for_same_seed():
     assert np.allclose(a.predict_proba(X[100:]), b.predict_proba(X[100:]), atol=0.0, rtol=0.0)
 
 
+def test_auto_interactions_are_deterministic_for_same_seed():
+    rng = np.random.default_rng(29)
+    X = rng.normal(size=(180, 8))
+    y = (
+        0.7 * X[:, 0]
+        - 0.4 * X[:, 1]
+        + 0.5 * X[:, 2] * X[:, 3]
+        + rng.normal(scale=0.1, size=180)
+    )
+
+    params = dict(
+        n_estimators=28,
+        learning_rate=0.12,
+        max_depth=3,
+        subsample=0.85,
+        colsample_bytree=0.75,
+        auto_interactions=True,
+        max_interaction_features=6,
+        interval_splits=False,
+        apx=False,
+        seed=29,
+    )
+    a = GTBoostRegressor(**params).fit(X[:130], y[:130], eval_set=[(X[130:155], y[130:155])])
+    b = GTBoostRegressor(**params).fit(X[:130], y[:130], eval_set=[(X[130:155], y[130:155])])
+
+    assert np.allclose(a.predict(X[155:]), b.predict(X[155:]), atol=0.0, rtol=0.0)
+
+
+def test_apx_weighting_aliases_predict():
+    rng = np.random.default_rng(21)
+    X = rng.normal(size=(150, 5))
+    y = (X[:, 0] + 0.4 * X[:, 1] + rng.normal(scale=0.2, size=150) > 0.1).astype(int)
+
+    for weighting in ["uniform", "linear", "flat", "triangle", "gauss"]:
+        clf = GTBoostClassifier(
+            n_estimators=28,
+            learning_rate=0.12,
+            max_depth=2,
+            apx=True,
+            apx_weighting=weighting,
+            apx_n_checkpoints=5,
+            apx_min_frac=0.35,
+            early_stopping_rounds=0,
+            seed=21,
+        ).fit(X[:110], y[:110])
+        proba = clf.predict_proba(X[110:])
+        assert proba.shape == (40, 2)
+        assert np.all(np.isfinite(proba))
+        assert np.allclose(proba.sum(axis=1), 1.0)
+
+
 def test_advanced_prediction_paths_smoke():
     rng = np.random.default_rng(23)
 
@@ -398,7 +672,7 @@ def test_advanced_prediction_paths_smoke():
     assert proba.shape == (40, 3)
     assert np.allclose(proba.sum(axis=1), 1.0)
 
-    # Self-score and ramp fallback path.
+    # Self-score fallback path. (ramp param removed 2026-06-10 — inert in ablation.)
     X_reg = rng.normal(size=(150, 4))
     y_reg = X_reg[:, 0] * 0.6 + X_reg[:, 1] * X_reg[:, 2] * 0.1 + rng.normal(scale=0.05, size=150)
     reg = GTBoostRegressor(
@@ -408,7 +682,6 @@ def test_advanced_prediction_paths_smoke():
         categorical_geometry="raw",
         interval_splits=True,
         self_score_splits=True,
-        ramp=True,
         apx=False,
         seed=26,
     ).fit(X_reg[:110], y_reg[:110])

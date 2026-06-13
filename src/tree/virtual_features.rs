@@ -78,6 +78,24 @@ pub enum VirtualFeatureDef {
     SqrtAbs { i: u32 },
     /// `raw_row[i] * raw_row[i]`.
     Square { i: u32 },
+    /// Thresholded Walsh pair: `sign(raw_row[i] > threshold_i) * sign(raw_row[j] > threshold_j)`.
+    /// This collapses a pure 2-way interaction/parity into one greedy-splittable coordinate.
+    Walsh2 {
+        i: u32,
+        threshold_i: f64,
+        j: u32,
+        threshold_j: f64,
+    },
+    /// Thresholded Walsh triple. Kept behind the LTSO accepted-feature cap and
+    /// generated through a small beam so wide data does not explode.
+    Walsh3 {
+        i: u32,
+        threshold_i: f64,
+        j: u32,
+        threshold_j: f64,
+        k: u32,
+        threshold_k: f64,
+    },
 }
 
 impl VirtualFeatureDef {
@@ -228,7 +246,49 @@ impl VirtualFeatureDef {
                     v * v
                 }
             }
+            VirtualFeatureDef::Walsh2 {
+                i,
+                threshold_i,
+                j,
+                threshold_j,
+            } => {
+                let a = raw_row[i as usize];
+                let b = raw_row[j as usize];
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    threshold_sign(a, threshold_i) * threshold_sign(b, threshold_j)
+                }
+            }
+            VirtualFeatureDef::Walsh3 {
+                i,
+                threshold_i,
+                j,
+                threshold_j,
+                k,
+                threshold_k,
+            } => {
+                let a = raw_row[i as usize];
+                let b = raw_row[j as usize];
+                let c = raw_row[k as usize];
+                if a.is_nan() || b.is_nan() || c.is_nan() {
+                    f64::NAN
+                } else {
+                    threshold_sign(a, threshold_i)
+                        * threshold_sign(b, threshold_j)
+                        * threshold_sign(c, threshold_k)
+                }
+            }
         }
+    }
+}
+
+#[inline]
+fn threshold_sign(v: f64, threshold: f64) -> f64 {
+    if v <= threshold {
+        -1.0
+    } else {
+        1.0
     }
 }
 
@@ -258,13 +318,13 @@ pub struct LtsoPremineConfig {
 
 impl Default for LtsoPremineConfig {
     fn default() -> Self {
-        // v6.1: keep alpha=0.05 (extreme α=0.01 starved the gate); modest
-        // max_accept=5 reduction from v1's 8. Product is still dropped
-        // (duplicates auto_interactions). Unary monotone transforms are also
-        // dropped after v6.0-v2.1 showed they crowd out useful pair operators.
+        // v6.2: product interactions stay out of LTSO after honest-admission
+        // probes showed they crowd out stronger ratio/diff/hinge operators under
+        // the small accepted-operator budget. Unary monotone transforms stay
+        // dropped because trees are invariant to them.
         Self {
             enabled: false,
-            top_var_k: 8,
+            top_var_k: 16,
             max_accept: 1,
             alpha: 0.05,
             n_bins: 32,
@@ -421,6 +481,9 @@ pub fn premine_candidates(
     let debug = std::env::var("GTBOOST_LTSO_DEBUG")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let walsh_only = std::env::var("GTBOOST_LTSO_WALSH_ONLY")
+        .map(|v| v != "0" && v.to_lowercase() != "false" && v.to_lowercase() != "off")
+        .unwrap_or(false);
 
     // Pick top-K numerics by variance.
     let mut var_of: Vec<(usize, f64)> = num_indices
@@ -446,7 +509,7 @@ pub fn premine_candidates(
     let top: Vec<usize> = var_of.iter().take(cfg.top_var_k).map(|&(i, _)| i).collect();
 
     // Build candidate pool:
-    // - ratio + diff per pair (no Product: duplicates auto_interactions)
+    // - ratio + diff per pair
     // - gradient-stump hinges on each top numeric
     // - gated numeric values from stump thresholds, e.g. x_j * 1[x_i > t]
     //
@@ -459,44 +522,49 @@ pub fn premine_candidates(
         let xi = &raw_values_by_col[i];
         if let Some(threshold) = best_gradient_stump_threshold(xi, residual, 16) {
             stump_thresholds.push((i, threshold));
-            let hinge_pos: Vec<f64> = xi
-                .iter()
-                .map(|&a| {
-                    if !a.is_finite() {
-                        f64::NAN
-                    } else {
-                        (a - threshold).max(0.0)
-                    }
-                })
-                .collect();
-            let op = VirtualFeatureDef::HingePos {
-                i: i as u32,
-                threshold,
-            };
-            let train_vals = clip_quantile(&hinge_pos, 0.001);
-            let eval_vals = eval_values_by_col
-                .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
-            candidates.push((op, train_vals, eval_vals));
-            let hinge_neg: Vec<f64> = xi
-                .iter()
-                .map(|&a| {
-                    if !a.is_finite() {
-                        f64::NAN
-                    } else {
-                        (threshold - a).max(0.0)
-                    }
-                })
-                .collect();
-            let op = VirtualFeatureDef::HingeNeg {
-                i: i as u32,
-                threshold,
-            };
-            let train_vals = clip_quantile(&hinge_neg, 0.001);
-            let eval_vals = eval_values_by_col
-                .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
-            candidates.push((op, train_vals, eval_vals));
+            if !walsh_only {
+                let hinge_pos: Vec<f64> = xi
+                    .iter()
+                    .map(|&a| {
+                        if !a.is_finite() {
+                            f64::NAN
+                        } else {
+                            (a - threshold).max(0.0)
+                        }
+                    })
+                    .collect();
+                let op = VirtualFeatureDef::HingePos {
+                    i: i as u32,
+                    threshold,
+                };
+                let train_vals = clip_quantile(&hinge_pos, 0.001);
+                let eval_vals = eval_values_by_col
+                    .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
+                candidates.push((op, train_vals, eval_vals));
+                let hinge_neg: Vec<f64> = xi
+                    .iter()
+                    .map(|&a| {
+                        if !a.is_finite() {
+                            f64::NAN
+                        } else {
+                            (threshold - a).max(0.0)
+                        }
+                    })
+                    .collect();
+                let op = VirtualFeatureDef::HingeNeg {
+                    i: i as u32,
+                    threshold,
+                };
+                let train_vals = clip_quantile(&hinge_neg, 0.001);
+                let eval_vals = eval_values_by_col
+                    .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
+                candidates.push((op, train_vals, eval_vals));
+            }
         }
-        // ── Pair ops on (i, j) — ratio + diff (no product) ──────────────
+        // ── Pair ops on (i, j): ratio + diff ────────────────────────────
+        if walsh_only {
+            continue;
+        }
         for &j in top.iter().skip(idx_i + 1) {
             let xj = &raw_values_by_col[j];
             let std_j: f64 = {
@@ -553,65 +621,183 @@ pub fn premine_candidates(
             candidates.push((op, diff_vals, eval_vals));
         }
     }
-    for &(gate_i, threshold) in &stump_thresholds {
-        let gate = &raw_values_by_col[gate_i];
-        for &value_j in &top {
-            if value_j == gate_i {
-                continue;
+    if !walsh_only {
+        for &(gate_i, threshold) in &stump_thresholds {
+            let gate = &raw_values_by_col[gate_i];
+            for &value_j in &top {
+                if value_j == gate_i {
+                    continue;
+                }
+                let xj = &raw_values_by_col[value_j];
+                let above_vals: Vec<f64> = gate
+                    .iter()
+                    .zip(xj.iter())
+                    .map(|(&g, &x)| {
+                        if !g.is_finite() || !x.is_finite() {
+                            f64::NAN
+                        } else if g > threshold {
+                            x
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let op = VirtualFeatureDef::GatedAbove {
+                    gate_i: gate_i as u32,
+                    value_j: value_j as u32,
+                    threshold,
+                };
+                let train_vals = clip_quantile(&above_vals, 0.001);
+                let eval_vals = eval_values_by_col
+                    .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
+                candidates.push((op, train_vals, eval_vals));
+                let below_vals: Vec<f64> = gate
+                    .iter()
+                    .zip(xj.iter())
+                    .map(|(&g, &x)| {
+                        if !g.is_finite() || !x.is_finite() {
+                            f64::NAN
+                        } else if g <= threshold {
+                            x
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let op = VirtualFeatureDef::GatedBelow {
+                    gate_i: gate_i as u32,
+                    value_j: value_j as u32,
+                    threshold,
+                };
+                let train_vals = clip_quantile(&below_vals, 0.001);
+                let eval_vals = eval_values_by_col
+                    .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
+                candidates.push((op, train_vals, eval_vals));
             }
-            let xj = &raw_values_by_col[value_j];
-            let above_vals: Vec<f64> = gate
-                .iter()
-                .zip(xj.iter())
-                .map(|(&g, &x)| {
-                    if !g.is_finite() || !x.is_finite() {
-                        f64::NAN
-                    } else if g > threshold {
-                        x
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            let op = VirtualFeatureDef::GatedAbove {
-                gate_i: gate_i as u32,
-                value_j: value_j as u32,
-                threshold,
-            };
-            let train_vals = clip_quantile(&above_vals, 0.001);
-            let eval_vals = eval_values_by_col
-                .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
-            candidates.push((op, train_vals, eval_vals));
-            let below_vals: Vec<f64> = gate
-                .iter()
-                .zip(xj.iter())
-                .map(|(&g, &x)| {
-                    if !g.is_finite() || !x.is_finite() {
-                        f64::NAN
-                    } else if g <= threshold {
-                        x
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-            let op = VirtualFeatureDef::GatedBelow {
-                gate_i: gate_i as u32,
-                value_j: value_j as u32,
-                threshold,
-            };
-            let train_vals = clip_quantile(&below_vals, 0.001);
-            let eval_vals = eval_values_by_col
-                .map(|cols| clip_quantile(&materialize_virtual_feature(&op, cols), 0.001));
-            candidates.push((op, train_vals, eval_vals));
         }
     }
+
+    // Thresholded Walsh interactions. This is the cheap production form of the
+    // middle-out finding: detect a small number of parity/interaction axes once,
+    // register only admitted virtual columns, then let ordinary greedy trees use
+    // them as degree-1 features. Candidate generation is beam-capped to avoid
+    // materializing O(p^3) crosses on wide data.
+    if std::env::var("GTBOOST_LTSO_WALSH")
+        .map(|v| v != "0" && v.to_lowercase() != "false" && v.to_lowercase() != "off")
+        .unwrap_or(true)
+        && top.len() >= 2
+    {
+        let pair_beam = std::env::var("GTBOOST_LTSO_WALSH_PAIR_BEAM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32)
+            .max(1);
+        let triple_beam = std::env::var("GTBOOST_LTSO_WALSH_TRIPLE_BEAM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16);
+
+        let sign_specs: Vec<(usize, f64, Vec<f64>)> = top
+            .iter()
+            .filter_map(|&i| {
+                let xi = &raw_values_by_col[i];
+                let threshold = best_gradient_stump_threshold(xi, residual, 16)
+                    .or_else(|| median_threshold(xi))?;
+                let signs = threshold_sign_column(xi, threshold);
+                if signs.iter().filter(|v| v.is_finite()).count() < 2 {
+                    None
+                } else {
+                    Some((i, threshold, signs))
+                }
+            })
+            .collect();
+
+        let mut pair_scores: Vec<(usize, usize, f64)> = Vec::new();
+        for a in 0..sign_specs.len() {
+            for b in a + 1..sign_specs.len() {
+                let score = product_corr_score(&sign_specs[a].2, &sign_specs[b].2, residual);
+                if score.is_finite() && score > 0.0 {
+                    pair_scores.push((a, b, score));
+                }
+            }
+        }
+        pair_scores.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+        });
+
+        let pair_specs: Vec<(usize, usize)> = pair_scores
+            .iter()
+            .take(pair_beam)
+            .map(|&(a, b, _)| (a, b))
+            .collect();
+        for &(a, b) in &pair_specs {
+            let (i, threshold_i, ref si) = sign_specs[a];
+            let (j, threshold_j, ref sj) = sign_specs[b];
+            let vals = product_columns(si, sj);
+            let op = VirtualFeatureDef::Walsh2 {
+                i: i as u32,
+                threshold_i,
+                j: j as u32,
+                threshold_j,
+            };
+            let eval_vals = eval_values_by_col.map(|cols| materialize_virtual_feature(&op, cols));
+            candidates.push((op, vals, eval_vals));
+        }
+
+        if triple_beam > 0 && sign_specs.len() >= 3 && !pair_specs.is_empty() {
+            let mut triple_scores: Vec<(usize, usize, usize, f64)> = Vec::new();
+            for &(a, b) in &pair_specs {
+                for c in 0..sign_specs.len() {
+                    if c == a || c == b {
+                        continue;
+                    }
+                    let score = product3_corr_score(
+                        &sign_specs[a].2,
+                        &sign_specs[b].2,
+                        &sign_specs[c].2,
+                        residual,
+                    );
+                    if score.is_finite() && score > 0.0 {
+                        let mut idxs = [a, b, c];
+                        idxs.sort_unstable();
+                        triple_scores.push((idxs[0], idxs[1], idxs[2], score));
+                    }
+                }
+            }
+            triple_scores.sort_by(|a, b| {
+                b.3.partial_cmp(&a.3)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+            });
+            triple_scores.dedup_by(|a, b| (a.0, a.1, a.2) == (b.0, b.1, b.2));
+            for &(a, b, c, _) in triple_scores.iter().take(triple_beam) {
+                let (i, threshold_i, ref si) = sign_specs[a];
+                let (j, threshold_j, ref sj) = sign_specs[b];
+                let (k, threshold_k, ref sk) = sign_specs[c];
+                let vals = product3_columns(si, sj, sk);
+                let op = VirtualFeatureDef::Walsh3 {
+                    i: i as u32,
+                    threshold_i,
+                    j: j as u32,
+                    threshold_j,
+                    k: k as u32,
+                    threshold_k,
+                };
+                let eval_vals =
+                    eval_values_by_col.map(|cols| materialize_virtual_feature(&op, cols));
+                candidates.push((op, vals, eval_vals));
+            }
+        }
+    }
+
     // N|C tools. These are the Rust version of the GGFP-v3 feature family
     // that actually transferred on mixed categorical/numeric tables: EB group
     // mean, deviation, and std. The op stores train-only maps, then eval/test
     // rows are mapped through the same maps with a global default for unseen
     // categories.
-    if !top.is_empty() && !cat_indices.is_empty() {
+    if !walsh_only && !top.is_empty() && !cat_indices.is_empty() {
         for &cat_j in cat_indices {
             if distinct_count(&raw_values_by_col[cat_j], 128) > 128 {
                 continue;
@@ -682,6 +868,41 @@ pub fn premine_candidates(
     let q = (1.0 - cfg.alpha / null_scores.len().max(1) as f64).clamp(0.0, 1.0);
     let q_idx = ((null_scores.len() - 1) as f64 * q) as usize;
     let threshold = null_scores[q_idx];
+    let honest_eval_threshold = if let (Some(er), true) = (eval_residual, has_honest_eval) {
+        let mut perm_eval = er.to_vec();
+        fisher_yates(&mut perm_eval, &mut rng_state);
+        candidates
+            .iter()
+            .filter_map(|(_, values, eval_values)| {
+                eval_values
+                    .as_ref()
+                    .and_then(|ev| honest_stump_transfer(values, residual, ev, &perm_eval))
+                    .map(|(_, eval_gain)| eval_gain)
+            })
+            .fold(0.0f64, f64::max)
+    } else {
+        threshold
+    };
+    let honest_eval_threshold = if walsh_only && has_honest_eval {
+        let null_mult = std::env::var("GTBOOST_LTSO_WALSH_NULL_MULT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(2.5)
+            .max(1.0);
+        honest_eval_threshold * null_mult
+    } else {
+        honest_eval_threshold
+    };
+    let accept_limit = if walsh_only {
+        std::env::var("GTBOOST_LTSO_WALSH_MAX_ACCEPT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+            .min(cfg.max_accept.max(1))
+    } else {
+        cfg.max_accept
+    };
 
     // OMP-style selection: after accepting a feature, project it out of the
     // residual before scoring the next one. This is the missing guard that v6
@@ -692,10 +913,10 @@ pub fn premine_candidates(
     let mut accepted: Vec<(VirtualFeatureDef, Vec<f64>, f64)> = Vec::new();
     let mut active = vec![true; candidates.len()];
     let mut honest_rejected = 0usize;
-    while accepted.len() < cfg.max_accept {
+    while accepted.len() < accept_limit {
         let mut best_idx = usize::MAX;
         let mut best_score = if has_honest_eval {
-            cfg.min_eval_gain_fraction
+            cfg.min_eval_gain_fraction.max(honest_eval_threshold)
         } else {
             threshold
         };
@@ -773,7 +994,7 @@ pub fn premine_candidates(
             accepted.len(),
             has_honest_eval,
             honest_rejected,
-            threshold,
+            if has_honest_eval { honest_eval_threshold } else { threshold },
         );
     }
     accepted
@@ -795,6 +1016,8 @@ fn op_label(op: &VirtualFeatureDef) -> &'static str {
         VirtualFeatureDef::Log1p { .. } => "log1p",
         VirtualFeatureDef::SqrtAbs { .. } => "sqrt_abs",
         VirtualFeatureDef::Square { .. } => "square",
+        VirtualFeatureDef::Walsh2 { .. } => "walsh2",
+        VirtualFeatureDef::Walsh3 { .. } => "walsh3",
     }
 }
 
@@ -1052,6 +1275,39 @@ pub fn materialize_virtual_feature(
                     v * v
                 }
             }
+            VirtualFeatureDef::Walsh2 {
+                i,
+                threshold_i,
+                j,
+                threshold_j,
+            } => {
+                let a = raw_values_by_col[*i as usize][row];
+                let b = raw_values_by_col[*j as usize][row];
+                if !a.is_finite() || !b.is_finite() {
+                    f64::NAN
+                } else {
+                    threshold_sign(a, *threshold_i) * threshold_sign(b, *threshold_j)
+                }
+            }
+            VirtualFeatureDef::Walsh3 {
+                i,
+                threshold_i,
+                j,
+                threshold_j,
+                k,
+                threshold_k,
+            } => {
+                let a = raw_values_by_col[*i as usize][row];
+                let b = raw_values_by_col[*j as usize][row];
+                let c = raw_values_by_col[*k as usize][row];
+                if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+                    f64::NAN
+                } else {
+                    threshold_sign(a, *threshold_i)
+                        * threshold_sign(b, *threshold_j)
+                        * threshold_sign(c, *threshold_k)
+                }
+            }
         })
         .collect()
 }
@@ -1176,6 +1432,75 @@ fn best_gradient_stump_threshold(values: &[f64], residual: &[f64], min_leaf: usi
         }
     }
     best_t
+}
+
+fn median_threshold(values: &[f64]) -> Option<f64> {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.len() < 2 {
+        return None;
+    }
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = finite.len() / 2;
+    let threshold = if finite.len() % 2 == 0 {
+        0.5 * (finite[mid - 1] + finite[mid])
+    } else {
+        finite[mid]
+    };
+    if threshold.is_finite() {
+        Some(threshold)
+    } else {
+        None
+    }
+}
+
+fn threshold_sign_column(values: &[f64], threshold: f64) -> Vec<f64> {
+    values
+        .iter()
+        .map(|&v| {
+            if !v.is_finite() {
+                f64::NAN
+            } else {
+                threshold_sign(v, threshold)
+            }
+        })
+        .collect()
+}
+
+fn product_columns(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            if x.is_finite() && y.is_finite() {
+                x * y
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+fn product3_columns(a: &[f64], b: &[f64], c: &[f64]) -> Vec<f64> {
+    a.iter()
+        .zip(b.iter())
+        .zip(c.iter())
+        .map(|((&x, &y), &z)| {
+            if x.is_finite() && y.is_finite() && z.is_finite() {
+                x * y * z
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+fn product_corr_score(a: &[f64], b: &[f64], residual: &[f64]) -> f64 {
+    let vals = product_columns(a, b);
+    corr_score(&vals, residual)
+}
+
+fn product3_corr_score(a: &[f64], b: &[f64], c: &[f64], residual: &[f64]) -> f64 {
+    let vals = product3_columns(a, b, c);
+    corr_score(&vals, residual)
 }
 
 fn center_in_place(values: &mut [f64]) {
@@ -1477,5 +1802,78 @@ impl BinnedData {
         //    every downstream consumer (find_best_split, histograms, etc.).
         self.n_features += 1;
         new_feature_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walsh_virtuals_eval_and_materialize() {
+        let op2 = VirtualFeatureDef::Walsh2 {
+            i: 0,
+            threshold_i: 0.0,
+            j: 1,
+            threshold_j: 0.0,
+        };
+        assert_eq!(op2.eval_raw_row(&[1.0, 2.0]), 1.0);
+        assert_eq!(op2.eval_raw_row(&[-1.0, 2.0]), -1.0);
+        assert!(op2.eval_raw_row(&[f64::NAN, 2.0]).is_nan());
+
+        let cols = vec![vec![-1.0, 1.0, -1.0, 1.0], vec![-1.0, -1.0, 1.0, 1.0]];
+        let vals = materialize_virtual_feature(&op2, &cols);
+        assert_eq!(vals, vec![1.0, -1.0, -1.0, 1.0]);
+
+        let op3 = VirtualFeatureDef::Walsh3 {
+            i: 0,
+            threshold_i: 0.0,
+            j: 1,
+            threshold_j: 0.0,
+            k: 2,
+            threshold_k: 0.0,
+        };
+        assert_eq!(op3.eval_raw_row(&[1.0, 2.0, 3.0]), 1.0);
+        assert_eq!(op3.eval_raw_row(&[-1.0, 2.0, 3.0]), -1.0);
+    }
+
+    #[test]
+    fn premine_accepts_honest_walsh_xor_axis() {
+        let mut x0 = Vec::new();
+        let mut x1 = Vec::new();
+        let mut residual = Vec::new();
+        for row in 0..240 {
+            let a = if row % 2 == 0 { -1.0 } else { 1.0 };
+            let b = if (row / 2) % 2 == 0 { -1.0 } else { 1.0 };
+            x0.push(a);
+            x1.push(b);
+            residual.push(a * b);
+        }
+        let raw = vec![x0.clone(), x1.clone()];
+        let eval_raw = vec![x0, x1];
+        let eval_residual = residual.clone();
+        let cfg = LtsoPremineConfig {
+            enabled: true,
+            top_var_k: 2,
+            max_accept: 2,
+            min_eval_gain_fraction: 1e-6,
+            ..Default::default()
+        };
+        let accepted = premine_candidates(
+            &raw,
+            &[0, 1],
+            &[],
+            &residual,
+            &cfg,
+            Some(&eval_raw),
+            Some(&eval_residual),
+        );
+        assert!(
+            accepted
+                .iter()
+                .any(|(op, _, _)| matches!(op, VirtualFeatureDef::Walsh2 { .. })),
+            "expected honest preminer to accept a thresholded Walsh2 axis, got {:?}",
+            accepted
+        );
     }
 }

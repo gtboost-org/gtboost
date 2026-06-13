@@ -799,13 +799,22 @@ impl GTBoostModel {
                                 let hx = &mut hx_buf[..k];
                                 let hxx = &mut hxx_buf[..k * k];
                                 let x_all = &x_all_buf[..k];
-                                // Accumulate statistics (upper triangle + mirror for hxx)
+                                // Per-sample rank-1 update of the (upper-triangle) hxx
+                                // matrix plus gx/hx accumulators. Splitting the inner
+                                // triangle write into a contiguous slice += scalar*slice
+                                // lets LLVM emit a SIMD-fma kernel; the original index
+                                // form blocked auto-vectorization because the loop
+                                // body still spoke in terms of `hxx[j*k+l]` arithmetic.
                                 for j in 0..k {
-                                    gx[j] += g * x_all[j];
-                                    hx[j] += h * x_all[j];
-                                    let hxj = h * x_all[j];
-                                    for l in j..k {
-                                        hxx[j * k + l] += hxj * x_all[l];
+                                    let xj = x_all[j];
+                                    gx[j] += g * xj;
+                                    hx[j] += h * xj;
+                                    let hxj = h * xj;
+                                    let row_start = j * k + j;
+                                    let hxx_row = &mut hxx[row_start..row_start + (k - j)];
+                                    let x_slice = &x_all[j..k];
+                                    for (cell, &xl) in hxx_row.iter_mut().zip(x_slice.iter()) {
+                                        *cell += hxj * xl;
                                     }
                                 }
                             }
@@ -845,10 +854,16 @@ impl GTBoostModel {
                                 }
                             }
                             let a = &mut a_buf[..k * k];
-                            a.fill(0.0);
+                            // Per-row vector form: a_row = hxx_row - hx[j] * x_bar. Slice
+                            // ops auto-vectorize; the original index form did not.
                             for j in 0..k {
-                                for l in 0..k {
-                                    a[j * k + l] = hxx[j * k + l] - hx[j] * x_bar[l];
+                                let hxj = hx[j];
+                                let a_row = &mut a[j * k..(j + 1) * k];
+                                let hxx_row = &hxx[j * k..(j + 1) * k];
+                                for ((a_cell, &hxx_cell), &xb) in
+                                    a_row.iter_mut().zip(hxx_row.iter()).zip(x_bar.iter())
+                                {
+                                    *a_cell = hxx_cell - hxj * xb;
                                 }
                                 a[j * k + j] += adaptive_ramp;
                             }
@@ -1193,7 +1208,82 @@ impl GTBoostModel {
         } // end for _pass
     }
 
-    pub(super) fn prune_similar_leaves(&mut self) {}
+    pub(super) fn prune_similar_leaves(&mut self) {
+        if self.trees.is_empty() {
+            return;
+        }
+        let lambda = self.lambda_reg.max(1e-12);
+        let z2_threshold = (0.75 + 4.0 * self.split_pessimism + self.gamma.max(0.0)).min(4.0);
+        for tree in self.trees.iter_mut() {
+            if !tree.split_features.is_empty() {
+                Self::prune_similar_leaves_tree(tree, 0, lambda, z2_threshold);
+            }
+        }
+    }
+
+    fn prune_similar_leaves_tree(
+        tree: &mut DecisionTree,
+        node: usize,
+        lambda: f64,
+        z2_threshold: f64,
+    ) -> bool {
+        if node >= tree.split_features.len() || tree.split_features[node] == u32::MAX {
+            return true;
+        }
+        let left = tree.left_children.get(node).copied().unwrap_or(0) as usize;
+        let right = tree.right_children.get(node).copied().unwrap_or(0) as usize;
+        if left >= tree.split_features.len() || right >= tree.split_features.len() {
+            return false;
+        }
+        let left_leaf = Self::prune_similar_leaves_tree(tree, left, lambda, z2_threshold);
+        let right_leaf = Self::prune_similar_leaves_tree(tree, right, lambda, z2_threshold);
+        if !(left_leaf && right_leaf) {
+            return false;
+        }
+
+        let lh = tree.node_h_sum.get(left).copied().unwrap_or(0.0).max(0.0);
+        let rh = tree.node_h_sum.get(right).copied().unwrap_or(0.0).max(0.0);
+        if lh <= 0.0 || rh <= 0.0 {
+            return false;
+        }
+        let lv = tree.values.get(left).copied().unwrap_or(0.0);
+        let rv = tree.values.get(right).copied().unwrap_or(0.0);
+        if !(lv.is_finite() && rv.is_finite()) {
+            return false;
+        }
+        let se2 = (1.0 / (lh + lambda) + 1.0 / (rh + lambda)).max(1e-12);
+        let z2 = (lv - rv) * (lv - rv) / se2;
+        if !(z2.is_finite() && z2 <= z2_threshold) {
+            return false;
+        }
+
+        let total_h = (lh + rh).max(1e-12);
+        tree.values[node] = (lv * lh + rv * rh) / total_h;
+        tree.split_features[node] = u32::MAX;
+        tree.left_children[node] = 0;
+        tree.right_children[node] = 0;
+        tree.is_cat_split[node] = false;
+        tree.is_oblique_split[node] = false;
+        if node < tree.cat_lookups.len() {
+            tree.cat_lookups[node] = None;
+        }
+        if node < tree.node_h_sum.len() {
+            tree.node_h_sum[node] = total_h;
+        }
+        if node < tree.node_count.len() {
+            let lc = tree.node_count.get(left).copied().unwrap_or(0);
+            let rc = tree.node_count.get(right).copied().unwrap_or(0);
+            tree.node_count[node] = lc.saturating_add(rc);
+        }
+        if tree.ramp_k > 0 && !tree.ramp_slopes.is_empty() {
+            let start = node.saturating_mul(tree.ramp_k);
+            let end = (start + tree.ramp_k).min(tree.ramp_slopes.len());
+            for v in tree.ramp_slopes[start..end].iter_mut() {
+                *v = 0.0;
+            }
+        }
+        true
+    }
 
     /// Global leaf optimization for multiclass: backfitting with cached routing.
     /// Honest-aware: uses complement data when tree_in_sample masks are available.

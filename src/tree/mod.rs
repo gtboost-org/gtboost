@@ -88,6 +88,32 @@ pub struct BinnedData {
     /// gain into a lower-confidence score that accounts for child support and
     /// split search width.
     pub split_pessimism: f64,
+    /// Residual-prototype categorical splits. When > 0, categorical values are
+    /// sorted by current g/h as usual, but split candidates are evaluated only
+    /// at at most this many hessian-balanced prototype boundaries.
+    pub cat_prototype_bins: usize,
+    /// Extra categorical-only gain audit. Positive values apply a support and
+    /// search-width penalty to categorical split candidates after the generic
+    /// split pessimism adjustment.
+    pub cat_audit_strength: f64,
+    /// Split contrast shrinkage. Positive values discount candidate gains whose
+    /// left/right Newton leaf values are weakly separated relative to their
+    /// curvature uncertainty and search width.
+    pub split_contrast_penalty: f64,
+    /// Free-tree permutation signal gate. When > 0, a node may split only if its
+    /// best gain exceeds `signal_gate` times the best gain found on a within-node
+    /// permutation of the gradients (an empirical multiple-testing noise floor
+    /// over the full feature/threshold search). Growth stops by itself when the
+    /// remaining signal is indistinguishable from noise. 0.0 = disabled.
+    #[serde(default)]
+    pub signal_gate: f64,
+    /// Training-only ROW-MAJOR bin cache (bins_rm[row * n_features + col]):
+    /// lets node-histogram building make ONE pass over the node's rows updating
+    /// every feature's histogram together (each row's bins share a cache line)
+    /// instead of one full pass per feature re-gathering g/h each time.
+    /// Rebuilt lazily whenever feature count changes; never serialized.
+    #[serde(skip)]
+    pub bins_row_major_cache: Vec<u16>,
 }
 
 impl BinnedData {
@@ -331,7 +357,29 @@ impl BinnedData {
             virtual_first_id: usize::MAX,
             virtual_defs: Vec::new(),
             split_pessimism: 0.0,
+            cat_prototype_bins: 0,
+            cat_audit_strength: 0.0,
+            split_contrast_penalty: 0.0,
+            signal_gate: 0.0,
+            bins_row_major_cache: Vec::new(),
         }
+    }
+
+    /// Build (or refresh after feature additions) the row-major bin cache used
+    /// by the one-pass node-histogram kernel.
+    pub fn ensure_row_major_cache(&mut self) {
+        let want = self.n_rows * self.n_features;
+        if self.bins_row_major_cache.len() == want {
+            return;
+        }
+        let mut rm = vec![0u16; want];
+        let nf = self.n_features;
+        rm.par_chunks_mut(nf).enumerate().for_each(|(row, chunk)| {
+            for (f, slot) in chunk.iter_mut().enumerate() {
+                *slot = self.bin_indices[f * self.n_rows + row];
+            }
+        });
+        self.bins_row_major_cache = rm;
     }
 
     /// Bin new data using pre-computed edges (for eval sets).
@@ -528,9 +576,187 @@ impl BinnedData {
         }
     }
 
+    /// Supervised DP-bin merge ("DP bins"): coarsen each NUMERIC feature from
+    /// its current fine quantile grid down to at most `target_bins` segments,
+    /// choosing the segment boundaries that maximize the Newton segmentation
+    /// score sum_seg sum_k (sum G_k)^2 / (count + lambda) of the INITIAL
+    /// gradient profile (`row_scores`, n_rows x n_outputs, row-major).
+    ///
+    /// Plain quantile binning spends resolution where X is dense; DP bins
+    /// spend it where the target structure changes — flat regions collapse
+    /// into single bins (fewer winner's-curse split candidates), steep regions
+    /// keep fine cuts (higher 1-D resolution). Every resulting edge is a
+    /// subset of the fine quantile edges, so eval/predict binning via
+    /// `bin_with_edges*` stays exactly consistent.
+    pub fn supervised_merge(&mut self, row_scores: &[f64], n_outputs: usize, target_bins: usize) {
+        let n_rows = self.n_rows;
+        if n_rows == 0
+            || n_outputs == 0
+            || target_bins < 4
+            || row_scores.len() < n_rows * n_outputs
+        {
+            return;
+        }
+        let lam = 1.0f64;
+        // Analytic noise floor of the segment score: for a pure-noise segment of
+        // count c, E[(sum G_k)^2/(c+lam)] = sigma2_k * c/(c+lam). Charging every
+        // segment its expected null score makes the DP form segments only where
+        // the 1-D signal exceeds noise; junk features collapse to few bins.
+        let mut sigma2 = 0.0f64;
+        for row in 0..n_rows {
+            for k in 0..n_outputs {
+                let v = row_scores[row * n_outputs + k];
+                sigma2 += v * v;
+            }
+        }
+        sigma2 /= n_rows.max(1) as f64;
+        struct MergePlan {
+            new_edges: Vec<f64>,
+            remap: Vec<u16>,
+        }
+        let plans: Vec<Option<MergePlan>> = (0..self.n_features)
+            .into_par_iter()
+            .map(|f| {
+                if f < self.is_categorical.len() && self.is_categorical[f] {
+                    return None;
+                }
+                let fbins = self.bin_edges[f].len();
+                if fbins <= target_bins || fbins < 8 {
+                    return None;
+                }
+                // Guard against pathological DP cost.
+                if fbins * fbins * target_bins > 80_000_000 {
+                    return None;
+                }
+                let col = &self.bin_indices[f * n_rows..(f + 1) * n_rows];
+                let mut g = vec![0.0f64; fbins * n_outputs];
+                let mut cnt = vec![0.0f64; fbins];
+                for row in 0..n_rows {
+                    let b = col[row];
+                    if b == MISSING_BIN {
+                        continue;
+                    }
+                    let b = b as usize;
+                    if b >= fbins {
+                        continue;
+                    }
+                    cnt[b] += 1.0;
+                    let base = row * n_outputs;
+                    for k in 0..n_outputs {
+                        g[b * n_outputs + k] += row_scores[base + k];
+                    }
+                }
+                // Prefix sums over fine bins.
+                let mut pg = vec![0.0f64; (fbins + 1) * n_outputs];
+                let mut pc = vec![0.0f64; fbins + 1];
+                for b in 0..fbins {
+                    pc[b + 1] = pc[b] + cnt[b];
+                    for k in 0..n_outputs {
+                        pg[(b + 1) * n_outputs + k] = pg[b * n_outputs + k] + g[b * n_outputs + k];
+                    }
+                }
+                let seg_score = |a: usize, b: usize| -> f64 {
+                    let c = pc[b] - pc[a];
+                    let mut s = 0.0f64;
+                    for k in 0..n_outputs {
+                        let d = pg[b * n_outputs + k] - pg[a * n_outputs + k];
+                        s += d * d;
+                    }
+                    // Subtract the expected score of a pure-noise segment so the
+                    // DP only pays for cuts that beat the 1-D noise floor.
+                    s / (c + lam) - sigma2 * c / (c + lam)
+                };
+                let bmax = target_bins.min(fbins);
+                // dp over (#segments, #fine bins consumed); roll the segment dim.
+                let mut prev = vec![f64::NEG_INFINITY; fbins + 1];
+                let mut cur = vec![f64::NEG_INFINITY; fbins + 1];
+                prev[0] = 0.0;
+                let mut choice = vec![0u32; (fbins + 1) * bmax];
+                let mut best_total = f64::NEG_INFINITY;
+                let mut best_s = 0usize;
+                for s in 0..bmax {
+                    for v in cur.iter_mut() {
+                        *v = f64::NEG_INFINITY;
+                    }
+                    for i in 1..=fbins {
+                        let mut best = f64::NEG_INFINITY;
+                        let mut bj = 0usize;
+                        for j in 0..i {
+                            if !prev[j].is_finite() {
+                                continue;
+                            }
+                            let v = prev[j] + seg_score(j, i);
+                            if v > best {
+                                best = v;
+                                bj = j;
+                            }
+                        }
+                        cur[i] = best;
+                        choice[i * bmax + s] = bj as u32;
+                    }
+                    if cur[fbins].is_finite() && cur[fbins] > best_total {
+                        best_total = cur[fbins];
+                        best_s = s;
+                    }
+                    std::mem::swap(&mut prev, &mut cur);
+                }
+                if !best_total.is_finite() {
+                    return None;
+                }
+                // Backtrack the cut positions (fine-bin indices that END segments).
+                let mut cuts: Vec<usize> = Vec::with_capacity(best_s + 1);
+                let mut i = fbins;
+                let mut s = best_s as isize;
+                while i > 0 && s >= 0 {
+                    cuts.push(i);
+                    i = choice[i * bmax + s as usize] as usize;
+                    s -= 1;
+                }
+                cuts.reverse();
+                if cuts.is_empty() || *cuts.last().unwrap() != fbins {
+                    return None;
+                }
+                // Build new edges (upper boundary of each segment) and the remap.
+                let old_edges = &self.bin_edges[f];
+                let mut new_edges: Vec<f64> = Vec::with_capacity(cuts.len());
+                let mut remap = vec![0u16; fbins];
+                let mut start = 0usize;
+                for (seg_idx, &end) in cuts.iter().enumerate() {
+                    new_edges.push(old_edges[end - 1]);
+                    for b in start..end {
+                        remap[b] = seg_idx as u16;
+                    }
+                    start = end;
+                }
+                Some(MergePlan { new_edges, remap })
+            })
+            .collect();
+
+        for (f, plan) in plans.into_iter().enumerate() {
+            let Some(plan) = plan else { continue };
+            for row in 0..n_rows {
+                let idx = f * n_rows + row;
+                let b = self.bin_indices[idx];
+                if b != MISSING_BIN && (b as usize) < plan.remap.len() {
+                    self.bin_indices[idx] = plan.remap[b as usize];
+                }
+            }
+            if f + 1 < self.non_missing_offsets.len() {
+                let (lo, hi) = (self.non_missing_offsets[f], self.non_missing_offsets[f + 1]);
+                for v in &mut self.non_missing_bin_values[lo..hi] {
+                    if *v != MISSING_BIN && (*v as usize) < plan.remap.len() {
+                        *v = plan.remap[*v as usize];
+                    }
+                }
+            }
+            self.bin_edges[f] = plan.new_edges;
+        }
+    }
+
     /// Append OTS-encoded numeric features to the binned data.
     /// `ots_values` is n_ots_cols x n_rows. Each column is quantile-binned and appended.
     pub fn add_ots_features(&mut self, ots_values: &[Vec<f64>], n_bins: usize) {
+        self.bins_row_major_cache.clear(); // invalidate one-pass hist cache
         for col_vals in ots_values {
             assert_eq!(col_vals.len(), self.n_rows);
             let mut sorted: Vec<f64> = col_vals.iter().copied().filter(|v| !v.is_nan()).collect();
@@ -600,6 +826,7 @@ impl BinnedData {
         values: &[f64],
         n_bins: usize,
     ) -> usize {
+        self.bins_row_major_cache.clear(); // invalidate one-pass hist cache
         assert_eq!(values.len(), self.n_rows);
         let mut sorted: Vec<f64> = values.iter().copied().filter(|v| !v.is_nan()).collect();
         sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -686,6 +913,7 @@ impl BinnedData {
     /// Each column is treated like a native categorical with exact-match bins plus
     /// an "other" bucket for unseen values.
     pub fn add_categorical_features(&mut self, cat_values: &[Vec<f64>]) {
+        self.bins_row_major_cache.clear(); // invalidate one-pass hist cache
         for col_vals in cat_values {
             assert_eq!(col_vals.len(), self.n_rows);
             let mut edges: Vec<f64> = col_vals.iter().copied().filter(|v| !v.is_nan()).collect();
@@ -878,22 +1106,20 @@ impl BinnedData {
 
 struct SplitCandidate {
     gain: f64,
+    priority: f64,
     node_idx: usize,
     start: usize,
     end: usize,
     depth: usize,
-    best_feat: usize,
-    best_bin: usize,
-    best_missing_left: bool,
-    best_cat_mask: CatBitmask,
-    best_is_cat: bool,
+    split: algorithms::SplitResult,
     g_sum: f64,
     h_sum: f64,
+    hists: Option<algorithms::NodeHists>,
 }
 
 impl PartialEq for SplitCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.gain == other.gain
+        self.priority == other.priority
     }
 }
 impl Eq for SplitCandidate {}
@@ -904,8 +1130,8 @@ impl PartialOrd for SplitCandidate {
 }
 impl Ord for SplitCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.gain
-            .partial_cmp(&other.gain)
+        self.priority
+            .partial_cmp(&other.priority)
             .unwrap_or(Ordering::Equal)
     }
 }
@@ -994,7 +1220,11 @@ pub(super) fn cll_bin_for_row(
     n_rows: usize,
     row: usize,
 ) -> usize {
-    let b1 = cll_bins[cll.feature as usize * n_rows + row];
+    let idx1 = cll.feature as usize * n_rows + row;
+    if idx1 >= cll_bins.len() {
+        return usize::MAX;
+    }
+    let b1 = cll_bins[idx1];
     if b1 == MISSING_BIN {
         return usize::MAX;
     }
@@ -1002,12 +1232,20 @@ pub(super) fn cll_bin_for_row(
         // Single feature
         b1 as usize
     } else {
-        let b2 = cll_bins[cll.feature2 as usize * n_rows + row];
+        let idx2 = cll.feature2 as usize * n_rows + row;
+        if idx2 >= cll_bins.len() {
+            return usize::MAX;
+        }
+        let b2 = cll_bins[idx2];
         if b2 == MISSING_BIN {
             return usize::MAX;
         }
         if cll.feature3 != u32::MAX {
-            let b3 = cll_bins[cll.feature3 as usize * n_rows + row];
+            let idx3 = cll.feature3 as usize * n_rows + row;
+            if idx3 >= cll_bins.len() {
+                return usize::MAX;
+            }
+            let b3 = cll_bins[idx3];
             if b3 == MISSING_BIN {
                 return usize::MAX;
             }
@@ -1091,7 +1329,7 @@ pub(super) fn raw_to_nll_bin(
     let mut hi = n_original;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if edges[mid] <= val {
+        if edges[mid] < val {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -1111,7 +1349,7 @@ pub(super) fn raw_to_num_bin(edges: &[f64], val: f64) -> Option<usize> {
     let mut hi = edges.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if edges[mid] <= val {
+        if edges[mid] < val {
             lo = mid + 1;
         } else {
             hi = mid;

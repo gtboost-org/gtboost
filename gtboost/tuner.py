@@ -28,6 +28,9 @@ class TuneResult:
     best_rounds: int
     study: Any
     task: str
+    best_score_std: float = 0.0
+    selection_score: float = 0.0
+    complexity_key: tuple[int, ...] = ()
 
 
 def _infer_task(y: np.ndarray, task: str) -> str:
@@ -109,9 +112,14 @@ def _suggest_params(
     max_rounds: int,
     categorical_geometry_choices: list[str],
     interval_choices: list[bool],
+    operator_mode: str,
 ) -> dict[str, Any]:
     max_rounds = max(1, int(max_rounds))
     min_rounds = min(100, max(1, max_rounds))
+    extended_ops = operator_mode == "extended"
+    grow_choices = ["depthwise", "leafwise"]
+    if extended_ops:
+        grow_choices.append("oblivious")
     params: dict[str, Any] = {
         "n_estimators": trial.suggest_int("n_estimators", min_rounds, max_rounds, log=True),
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
@@ -122,21 +130,57 @@ def _suggest_params(
         "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 50.0, log=True),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
         "num_bins": trial.suggest_categorical("num_bins", [64, 128, 256]),
-        "grow_policy": trial.suggest_categorical("grow_policy", ["depthwise", "leafwise"]),
+        "grow_policy": trial.suggest_categorical("grow_policy", grow_choices),
     }
 
+    if extended_ops and task in {"binary", "regression"} and n_features >= 2:
+        params["sparse_oblique_splits"] = trial.suggest_categorical(
+            "sparse_oblique_splits", [False, True]
+        )
+        params["auto_interactions"] = trial.suggest_categorical(
+            "auto_interactions", [False, True]
+        )
+    leaf_linear = False
     if n_features <= 16:
         params["leaf_linear"] = trial.suggest_categorical("leaf_linear", [False, True])
-        if params["leaf_linear"]:
+        leaf_linear = bool(params["leaf_linear"])
+        if leaf_linear:
             params["n_refine"] = trial.suggest_int("n_refine", 0, 2)
             params["n_leaf_splits"] = trial.suggest_int("n_leaf_splits", 0, 1)
+
+    if extended_ops and task in {"binary", "regression"} and not leaf_linear:
+        params["expert_leaf_admission"] = trial.suggest_categorical(
+            "expert_leaf_admission", [False, True]
+        )
+        if params["expert_leaf_admission"]:
+            params["expert_min_leaf"] = 24
+
+    if extended_ops and task in {"binary", "regression"}:
+        params["corrective_block_refit"] = trial.suggest_categorical(
+            "corrective_block_refit", [False, True]
+        )
+        if params["corrective_block_refit"]:
+            params["corrective_blocks"] = trial.suggest_categorical(
+                "corrective_blocks", [4, 8, 16, 32]
+            )
+            params["corrective_lambda"] = trial.suggest_float(
+                "corrective_lambda", 1e-3, 3.0, log=True
+            )
+            params["corrective_blend"] = trial.suggest_float(
+                "corrective_blend", 0.25, 1.0
+            )
+            params["corrective_audit_fraction"] = 0.2
 
     if interval_choices:
         params["interval_splits"] = trial.suggest_categorical(
             "interval_splits", interval_choices
         )
 
-    if has_categoricals and task == "binary" and len(categorical_geometry_choices) >= 2:
+    if (
+        has_categoricals
+        and task in {"binary", "multiclass", "regression"}
+        and len(categorical_geometry_choices) >= 2
+    ):
         geom = trial.suggest_categorical(
             "categorical_geometry", categorical_geometry_choices
         )
@@ -144,6 +188,33 @@ def _suggest_params(
             params["categorical_geometry"] = geom
 
     return params
+
+
+def _complexity_key(params: Mapping[str, Any]) -> tuple[int, ...]:
+    """Lexicographic model complexity exposed for tuner diagnostics.
+
+    The first element counts optional high-capacity operator families.  Later
+    elements describe leaf-linear usage, depth, bin resolution, and rounds.
+    """
+
+    categorical_geometry = str(params.get("categorical_geometry", "raw")).lower()
+    optional_ops = (
+        bool(params.get("sparse_oblique_splits", False)),
+        bool(params.get("auto_interactions", False)),
+        bool(params.get("interval_splits", False)),
+        bool(params.get("leaf_linear", False)),
+        bool(params.get("expert_leaf_admission", False)),
+        bool(params.get("corrective_block_refit", False)),
+        categorical_geometry not in {"", "raw", "none", "off"},
+    )
+    bin_rank = {64: 0, 128: 1, 256: 2}.get(int(params.get("num_bins", 256)), 3)
+    return (
+        int(sum(optional_ops)),
+        int(bool(params.get("leaf_linear", False))),
+        int(params.get("max_depth", 0)),
+        int(bin_rank),
+        int(params.get("n_estimators", 0)),
+    )
 
 
 def _fit_and_score(
@@ -194,12 +265,18 @@ def tune_gtboost(
     param_overrides: Mapping[str, Any] | None = None,
     categorical_geometry_choices: Iterable[str] | None = None,
     interval_splits: str | bool = "auto",
+    operator_mode: str = "core",
+    robust_selection: bool = False,
+    robust_z: float = 1.0,
     verbose: bool = False,
 ) -> TuneResult:
     """Tune GTBoost with a compact, general Optuna search.
 
-    Parameters are intentionally algorithmic.  Optional feature families such as
-    PCF and interval splits are only searched when explicitly requested.
+    Parameters are intentionally algorithmic.  The default search space is
+    conservative: standard GTBoost trees only, with experimental operator
+    families enabled only when ``operator_mode="extended"``.  Set
+    ``robust_selection=True`` to optimize mean CV loss plus a one-standard-error
+    uncertainty charge.
     """
 
     try:
@@ -212,6 +289,9 @@ def tune_gtboost(
 
     y_arr = np.asarray(y)
     task = _infer_task(y_arr, task)
+    operator_mode = str(operator_mode).strip().lower()
+    if operator_mode not in {"core", "extended"}:
+        raise ValueError("operator_mode must be 'core' or 'extended'")
     metric_fn = metric or _default_metric(task)
     n_features = int(X.shape[1]) if hasattr(X, "shape") else int(np.asarray(X).shape[1])
 
@@ -248,6 +328,7 @@ def tune_gtboost(
             max_rounds=max_rounds,
             categorical_geometry_choices=geom_choices,
             interval_choices=interval_choices,
+            operator_mode=operator_mode,
         )
         params.update(overrides)
         scores: list[float] = []
@@ -267,9 +348,19 @@ def tune_gtboost(
             )
             scores.append(score)
             rounds.append(n_trees)
+        mean_score = float(np.mean(scores))
+        score_std = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+        score_se = score_std / max(len(scores), 1) ** 0.5
+        selection_score = mean_score + max(0.0, float(robust_z)) * score_se
+        if not robust_selection:
+            selection_score = mean_score
         trial.set_user_attr("params", dict(params))
         trial.set_user_attr("rounds", int(round(np.mean(rounds))))
-        return float(np.mean(scores))
+        trial.set_user_attr("mean_score", mean_score)
+        trial.set_user_attr("score_std", score_std)
+        trial.set_user_attr("selection_score", float(selection_score))
+        trial.set_user_attr("complexity_key", list(_complexity_key(params)))
+        return float(selection_score)
 
     study = optuna.create_study(
         direction="minimize",
@@ -281,12 +372,19 @@ def tune_gtboost(
     best_params = dict(best_trial.user_attrs.get("params", best_trial.params))
     best_rounds = int(best_trial.user_attrs.get("rounds", best_params.get("n_estimators", max_rounds)))
     best_params["n_estimators"] = best_rounds
+    best_mean_score = float(best_trial.user_attrs.get("mean_score", best_trial.value))
+    best_score_std = float(best_trial.user_attrs.get("score_std", 0.0))
+    selection_score = float(best_trial.user_attrs.get("selection_score", best_trial.value))
+    complexity_key = tuple(best_trial.user_attrs.get("complexity_key", _complexity_key(best_params)))
     return TuneResult(
         best_params=best_params,
-        best_score=float(best_trial.value),
+        best_score=best_mean_score,
         best_rounds=best_rounds,
         study=study,
         task=task,
+        best_score_std=best_score_std,
+        selection_score=selection_score,
+        complexity_key=complexity_key,
     )
 
 

@@ -35,6 +35,62 @@ use crate::helpers::{bitvec_test, solve_small_linear_system, solve_spd};
 use crate::tree::{BinnedData, CatTupleConfig, DecisionTree, MISSING_BIN};
 
 impl GTBoostModel {
+    fn median_sorted(values: &mut [f64]) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = values.len();
+        if n & 1 == 1 {
+            values[n / 2]
+        } else {
+            0.5 * (values[n / 2 - 1] + values[n / 2])
+        }
+    }
+
+    /// Robust, scale-free Huber delta for regression residuals.
+    ///
+    /// Negative `huber_delta` enables this path.  The scale estimate is the
+    /// Gaussian-consistent MAD of current residuals, and the Huber cutoff uses
+    /// the classical 95%-efficient normal-theory constant.  For very large data
+    /// a deterministic stride sample keeps the per-round cost bounded while
+    /// preserving determinism.
+    fn adaptive_huber_delta(y: &[f64], preds: &[f64]) -> f64 {
+        const MAX_SCALE_SAMPLE: usize = 16_384;
+        const NORMAL_MAD_SCALE: f64 = 1.4826;
+        const HUBER_95_EFFICIENCY: f64 = 1.345;
+
+        let n = y.len().min(preds.len());
+        if n == 0 {
+            return 0.0;
+        }
+        let stride = n.div_ceil(MAX_SCALE_SAMPLE).max(1);
+        let mut residuals = Vec::with_capacity(n.div_ceil(stride));
+        let mut i = 0usize;
+        while i < n {
+            let r = preds[i] - y[i];
+            if r.is_finite() {
+                residuals.push(r);
+            }
+            i += stride;
+        }
+        if residuals.len() < 4 {
+            return 0.0;
+        }
+
+        let center = Self::median_sorted(&mut residuals);
+        for r in residuals.iter_mut() {
+            *r = (*r - center).abs();
+        }
+        let mad = Self::median_sorted(&mut residuals);
+        let sigma = NORMAL_MAD_SCALE * mad;
+        if sigma.is_finite() && sigma > 1e-12 {
+            HUBER_95_EFFICIENCY * sigma
+        } else {
+            0.0
+        }
+    }
+
     pub(super) fn cat_tuple_config(&self, binned: &BinnedData) -> Option<CatTupleConfig> {
         if !self.cat_tuple_lookups || self.cat_lookup_smooth <= 0.0 || self.task == "regression" {
             return None;
@@ -111,6 +167,15 @@ impl GTBoostModel {
             extra_cols.extend(ordered_ctr_cols);
         }
 
+        let cfe_cols = self.cat_fold_evidence_columns_for_raw(x_data_raw, n_rows, n_features_raw);
+        if !cfe_cols.is_empty() {
+            extra_cols.extend(cfe_cols);
+        }
+        let resid_cols = self.cfe_residual_columns_for_raw(x_data_raw, n_rows, n_features_raw);
+        if !resid_cols.is_empty() {
+            extra_cols.extend(resid_cols);
+        }
+
         if extra_cols.is_empty() {
             return (x_data_raw.to_vec(), n_features_raw);
         }
@@ -135,6 +200,8 @@ impl GTBoostModel {
             || !self.ordered_ctr_features.is_empty()
             || !self.ordered_ctr_pair_features.is_empty()
             || !self.ordered_ctr_triple_features.is_empty()
+            || !self.cfe_tuples.is_empty()
+            || !self.cfe_resid_tables.is_empty()
     }
 
     pub(super) fn apply_corrective_block_refit(
@@ -145,9 +212,10 @@ impl GTBoostModel {
         n_features_raw: usize,
         y: &[f64],
         init_score: Option<&[f64]>,
+        eval_guard: Option<(&[f64], &[f64], usize)>,
     ) {
         if !self.corrective_block_refit
-            || self.task != "regression"
+            || !(self.task == "regression" || self.task == "binary")
             || n_rows == 0
             || y.len() != n_rows
             || self.learning_rate.abs() <= 1e-15
@@ -185,9 +253,11 @@ impl GTBoostModel {
 
         let mut phi = vec![0.0f64; n_rows * n_blocks];
         let mut target = vec![0.0f64; n_rows];
+        let mut offsets = vec![0.0f64; n_rows];
         for row in 0..n_rows {
             let row_data = &x_data[row * n_features..(row + 1) * n_features];
             let offset = init_score.map(|s| s[row]).unwrap_or(self.base_score);
+            offsets[row] = offset;
             target[row] = y[row] - offset;
             let mut running_score = offset;
             for (t_idx, tree) in self.trees.iter().enumerate() {
@@ -201,6 +271,264 @@ impl GTBoostModel {
                 phi[row * n_blocks + block] += contribution;
                 running_score += contribution;
             }
+        }
+
+        let eval_phi_offsets = eval_guard.and_then(|(eval_x_raw, eval_y, eval_n_rows)| {
+            if eval_n_rows == 0
+                || eval_y.len() != eval_n_rows
+                || eval_x_raw.len() != eval_n_rows.saturating_mul(n_features_raw)
+            {
+                return None;
+            }
+            let (eval_x, eval_n_features) =
+                self.extend_raw_matrix(eval_x_raw, eval_n_rows, n_features_raw);
+            if eval_n_features != binned.n_features
+                || eval_x.len() != eval_n_rows.saturating_mul(eval_n_features)
+            {
+                return None;
+            }
+            let mut eval_phi = vec![0.0f64; eval_n_rows * n_blocks];
+            let mut eval_offsets = vec![0.0f64; eval_n_rows];
+            for row in 0..eval_n_rows {
+                let row_data = &eval_x[row * eval_n_features..(row + 1) * eval_n_features];
+                let offset = self.base_score;
+                eval_offsets[row] = offset;
+                let mut running_score = offset;
+                for (t_idx, tree) in self.trees.iter().enumerate() {
+                    let c = if tree.has_self_score_splits() {
+                        tree.predict_raw_row_with_score(binned, row_data, running_score)
+                    } else {
+                        tree.predict_raw_row(binned, row_data)
+                    };
+                    let contribution = self.learning_rate * c;
+                    let block = block_of_tree[t_idx];
+                    eval_phi[row * n_blocks + block] += contribution;
+                    running_score += contribution;
+                }
+            }
+            Some((eval_phi, eval_offsets, eval_y, eval_n_rows))
+        });
+
+        if self.task == "binary" {
+            let logistic_loss = |yi: f64, margin: f64| -> Option<f64> {
+                let z = margin.clamp(-50.0, 50.0);
+                if yi > 0.5 {
+                    Some((1.0 + (-z).exp()).ln())
+                } else {
+                    Some((1.0 + z.exp()).ln())
+                }
+            };
+
+            let score_rows = |row_filter: &dyn Fn(usize) -> bool, weights: &[f64]| -> Option<f64> {
+                let mut loss = 0.0f64;
+                let mut count = 0usize;
+                for row in 0..n_rows {
+                    if !row_filter(row) {
+                        continue;
+                    }
+                    let row_phi = &phi[row * n_blocks..(row + 1) * n_blocks];
+                    let mut margin = offsets[row];
+                    for block in 0..n_blocks {
+                        margin += weights[block] * row_phi[block];
+                    }
+                    loss += logistic_loss(y[row], margin)?;
+                    count += 1;
+                }
+                if count == 0 || !loss.is_finite() {
+                    None
+                } else {
+                    Some(loss)
+                }
+            };
+
+            let solve_on_rows = |row_filter: &dyn Fn(usize) -> bool| -> Option<Vec<f64>> {
+                let mut theta = vec![1.0f64; n_blocks];
+                let mut fit_count = 0usize;
+                let mut base_energy = vec![0.0f64; n_blocks];
+                for row in 0..n_rows {
+                    if !row_filter(row) {
+                        continue;
+                    }
+                    fit_count += 1;
+                    let row_phi = &phi[row * n_blocks..(row + 1) * n_blocks];
+                    for block in 0..n_blocks {
+                        let v = row_phi[block];
+                        if !v.is_finite() {
+                            return None;
+                        }
+                        base_energy[block] += v * v;
+                    }
+                }
+                if fit_count <= n_blocks {
+                    return None;
+                }
+                let mean_energy =
+                    base_energy.iter().sum::<f64>() / (n_blocks as f64 * fit_count as f64);
+                if !mean_energy.is_finite() || mean_energy <= 1e-18 {
+                    return None;
+                }
+                let ridge = self.corrective_lambda * mean_energy.max(1e-12);
+
+                for _ in 0..12 {
+                    let mut gram = vec![0.0f64; n_blocks * n_blocks];
+                    let mut rhs = vec![0.0f64; n_blocks];
+                    for row in 0..n_rows {
+                        if !row_filter(row) {
+                            continue;
+                        }
+                        let row_phi = &phi[row * n_blocks..(row + 1) * n_blocks];
+                        let mut margin = offsets[row];
+                        for block in 0..n_blocks {
+                            margin += theta[block] * row_phi[block];
+                        }
+                        let p = 1.0 / (1.0 + (-margin.clamp(-50.0, 50.0)).exp());
+                        let err = p - y[row];
+                        let w = (p * (1.0 - p)).max(1e-8);
+                        for i in 0..n_blocks {
+                            let vi = row_phi[i];
+                            rhs[i] -= vi * err;
+                            for j in 0..=i {
+                                gram[i * n_blocks + j] += w * vi * row_phi[j];
+                            }
+                        }
+                    }
+                    for i in 0..n_blocks {
+                        rhs[i] -= ridge * (theta[i] - 1.0);
+                        gram[i * n_blocks + i] += ridge;
+                        for j in 0..i {
+                            gram[j * n_blocks + i] = gram[i * n_blocks + j];
+                        }
+                    }
+                    let step = solve_spd(n_blocks, &gram, &rhs);
+                    if step.len() != n_blocks || step.iter().any(|v| !v.is_finite()) {
+                        return None;
+                    }
+                    let mut max_abs_step = 0.0f64;
+                    for block in 0..n_blocks {
+                        let delta = step[block].clamp(-1.0, 1.0);
+                        theta[block] = (theta[block] + delta).clamp(-5.0, 5.0);
+                        max_abs_step = max_abs_step.max(delta.abs());
+                    }
+                    if max_abs_step < 1e-5 {
+                        break;
+                    }
+                }
+                Some(theta)
+            };
+
+            let audit_fraction = self.corrective_audit_fraction.clamp(0.0, 0.5);
+            let mut fold_of_row = vec![usize::MAX; n_rows];
+            let mut audit_folds = 0usize;
+            let mut use_audit = false;
+            if audit_fraction > 0.0 && n_rows >= 80 && n_blocks + 2 < n_rows {
+                audit_folds = ((1.0 / audit_fraction).round() as usize).clamp(2, 10);
+                let mut fold_counts = vec![0usize; audit_folds];
+                let split_seed = self.seed ^ 0xB10C_C0A7_E57B_1A5Eu64;
+                for row in 0..n_rows {
+                    let mut z = (row as u64)
+                        .wrapping_add(0x9E37_79B9_7F4A_7C15u64)
+                        .wrapping_add(split_seed);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9u64);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EBu64);
+                    z ^= z >> 31;
+                    let fold = (z as usize) % audit_folds;
+                    fold_of_row[row] = fold;
+                    fold_counts[fold] += 1;
+                }
+                let min_selector = (n_blocks + 2).max(32);
+                let min_fold = 24usize;
+                let max_fold = fold_counts.iter().copied().max().unwrap_or(0);
+                if fold_counts.iter().all(|&c| c >= min_fold)
+                    && n_rows.saturating_sub(max_fold) >= min_selector
+                {
+                    use_audit = true;
+                } else {
+                    audit_folds = 0;
+                }
+            }
+
+            let blend = self.corrective_blend;
+            if use_audit {
+                let ones = vec![1.0f64; n_blocks];
+                let mut base_loss = 0.0f64;
+                let mut refit_loss = 0.0f64;
+                for fold in 0..audit_folds {
+                    let coef_fold = match solve_on_rows(&|row| fold_of_row[row] != fold) {
+                        Some(c) => c,
+                        None => return,
+                    };
+                    let mut fold_weights = vec![1.0f64; n_blocks];
+                    for block in 0..n_blocks {
+                        let c = coef_fold[block].clamp(-5.0, 5.0);
+                        fold_weights[block] = 1.0 + blend * (c - 1.0);
+                    }
+                    base_loss += match score_rows(&|row| fold_of_row[row] == fold, &ones) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    refit_loss += match score_rows(&|row| fold_of_row[row] == fold, &fold_weights) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                }
+                if !base_loss.is_finite() || !refit_loss.is_finite() || base_loss <= 1e-24 {
+                    return;
+                }
+                let required = 1.0 - self.corrective_min_rel_improve;
+                let bic_penalty = 0.5 * n_blocks as f64 * (n_rows.max(2) as f64).ln();
+                if refit_loss + bic_penalty > base_loss * required {
+                    return;
+                }
+            }
+
+            let coef = match solve_on_rows(&|_| true) {
+                Some(c) => c,
+                None => return,
+            };
+            let mut block_weights = vec![1.0f64; n_blocks];
+            for block in 0..n_blocks {
+                let c = coef[block].clamp(-5.0, 5.0);
+                block_weights[block] = 1.0 + blend * (c - 1.0);
+            }
+            if let Some((ref eval_phi, ref eval_offsets, eval_y, eval_n_rows)) = eval_phi_offsets {
+                let eval_score = |weights: &[f64]| -> Option<f64> {
+                    let mut loss = 0.0f64;
+                    for row in 0..eval_n_rows {
+                        let row_phi = &eval_phi[row * n_blocks..(row + 1) * n_blocks];
+                        let mut margin = eval_offsets[row];
+                        for block in 0..n_blocks {
+                            margin += weights[block] * row_phi[block];
+                        }
+                        loss += logistic_loss(eval_y[row], margin)?;
+                    }
+                    if loss.is_finite() {
+                        Some(loss)
+                    } else {
+                        None
+                    }
+                };
+                let ones = vec![1.0f64; n_blocks];
+                let base_eval = match eval_score(&ones) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let refit_eval = match eval_score(&block_weights) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let bic_penalty = 0.5 * n_blocks as f64 * (eval_n_rows.max(2) as f64).ln();
+                if refit_eval + bic_penalty > base_eval * (1.0 - self.corrective_min_rel_improve) {
+                    return;
+                }
+            }
+            let mut weights = vec![1.0f64; n_trees];
+            for block in 0..n_blocks {
+                for t in block_starts[block]..block_ends[block] {
+                    weights[t] = block_weights[block];
+                }
+            }
+            self.dart_tree_weights = weights;
+            return;
         }
 
         let solve_on_rows = |row_filter: &dyn Fn(usize) -> bool| -> Option<Vec<f64>> {
@@ -336,7 +664,10 @@ impl GTBoostModel {
                 return;
             }
             let required = 1.0 - self.corrective_min_rel_improve;
-            if refit_sse > base_sse * required {
+            let checked_f = checked.max(2) as f64;
+            let bic_delta = checked_f * (refit_sse / base_sse).max(1e-30).ln()
+                + n_blocks as f64 * checked_f.ln();
+            if refit_sse > base_sse * required || bic_delta > 0.0 {
                 return;
             }
         }
@@ -349,6 +680,40 @@ impl GTBoostModel {
         for block in 0..n_blocks {
             let c = coef[block].clamp(-5.0, 5.0);
             block_weights[block] = 1.0 + blend * (c - 1.0);
+        }
+        if let Some((ref eval_phi, ref eval_offsets, eval_y, eval_n_rows)) = eval_phi_offsets {
+            let eval_sse = |weights: &[f64]| -> Option<f64> {
+                let mut sse = 0.0f64;
+                for row in 0..eval_n_rows {
+                    let row_phi = &eval_phi[row * n_blocks..(row + 1) * n_blocks];
+                    let mut pred = eval_offsets[row];
+                    for block in 0..n_blocks {
+                        pred += weights[block] * row_phi[block];
+                    }
+                    let r = eval_y[row] - pred;
+                    sse += r * r;
+                }
+                if sse.is_finite() {
+                    Some(sse)
+                } else {
+                    None
+                }
+            };
+            let ones = vec![1.0f64; n_blocks];
+            let base_eval = match eval_sse(&ones) {
+                Some(v) => v,
+                None => return,
+            };
+            let refit_eval = match eval_sse(&block_weights) {
+                Some(v) => v,
+                None => return,
+            };
+            let eval_n = eval_n_rows.max(2) as f64;
+            let bic_delta = eval_n * (refit_eval / base_eval.max(1e-30)).max(1e-30).ln()
+                + n_blocks as f64 * eval_n.ln();
+            if refit_eval > base_eval * (1.0 - self.corrective_min_rel_improve) || bic_delta > 0.0 {
+                return;
+            }
         }
 
         let mut weights = vec![1.0f64; n_trees];
@@ -454,6 +819,65 @@ impl GTBoostModel {
         }
     }
 
+    fn ctr_multiclass_logloss_score(
+        keys: &[i64],
+        y: &[f64],
+        n_classes: usize,
+        priors: &[f64],
+        smooth: f64,
+        min_count: usize,
+    ) -> f64 {
+        if n_classes < 2 || keys.is_empty() || keys.len() != y.len() {
+            return 0.0;
+        }
+        let mut stats: HashMap<i64, (usize, Vec<f64>)> = HashMap::new();
+        for (&key, &label) in keys.iter().zip(y.iter()) {
+            if !label.is_finite() || label < 0.0 {
+                continue;
+            }
+            let cls = label.round() as usize;
+            if cls >= n_classes || (label - cls as f64).abs() > 1e-6 {
+                continue;
+            }
+            let entry = stats
+                .entry(key)
+                .or_insert_with(|| (0usize, vec![0.0; n_classes]));
+            entry.0 += 1;
+            entry.1[cls] += 1.0;
+        }
+        if stats.len() < 2 {
+            return 0.0;
+        }
+
+        let mut total = 0usize;
+        let mut score = 0.0;
+        for &(cnt, ref counts) in stats.values() {
+            if cnt < min_count {
+                continue;
+            }
+            let mut base_loss = 0.0;
+            let mut enc_loss = 0.0;
+            for k in 0..n_classes {
+                let class_count = counts[k];
+                if class_count <= 0.0 {
+                    continue;
+                }
+                let prior = Self::ctr_clip_prob(priors.get(k).copied().unwrap_or(0.0));
+                let enc =
+                    Self::ctr_clip_prob((class_count + smooth * prior) / (cnt as f64 + smooth));
+                base_loss -= class_count * prior.ln();
+                enc_loss -= class_count * enc.ln();
+            }
+            score += base_loss - enc_loss;
+            total += cnt;
+        }
+        if total >= min_count * 2 && score.is_finite() {
+            score
+        } else {
+            0.0
+        }
+    }
+
     fn ctr_oof_columns(
         keys: &[i64],
         y: &[f64],
@@ -521,6 +945,7 @@ impl GTBoostModel {
         n_features: usize,
     ) -> Vec<Vec<f64>> {
         self.ordered_ctr_features.clear();
+        self.ordered_ctr_priors.clear();
         self.ordered_ctr_maps.clear();
         self.ordered_ctr_count_maps.clear();
         self.ordered_ctr_pair_features.clear();
@@ -531,21 +956,104 @@ impl GTBoostModel {
         self.ordered_ctr_triple_count_maps.clear();
         self.ordered_ctr_prior = 0.0;
 
-        if !self.ordered_ctr
-            || n_rows == 0
-            || n_features == 0
-            || self.task == "multiclass"
-            || self.ordered_ctr_top_features == 0
+        if !self.ordered_ctr || n_rows == 0 || n_features == 0 || self.ordered_ctr_top_features == 0
         {
             return Vec::new();
         }
 
-        let prior = y.iter().sum::<f64>() / n_rows as f64;
-        self.ordered_ctr_prior = prior;
         let min_count = self.ordered_ctr_min_count.max(1);
         let pair_expected_min = self.ordered_ctr_min_count.max(5) as f64;
         let smooth = self.ordered_ctr_smooth.max(1e-12);
         let mut scored: Vec<(usize, f64, Vec<i64>)> = Vec::new();
+
+        if self.task == "multiclass" {
+            let n_classes = y
+                .iter()
+                .filter(|&&label| label.is_finite() && label >= 0.0)
+                .map(|&label| label.round() as usize)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            if n_classes < 2 {
+                return Vec::new();
+            }
+            let mut class_counts = vec![0.0; n_classes];
+            let mut valid_rows = 0usize;
+            for &label in y {
+                if !label.is_finite() || label < 0.0 {
+                    continue;
+                }
+                let cls = label.round() as usize;
+                if cls < n_classes && (label - cls as f64).abs() <= 1e-6 {
+                    class_counts[cls] += 1.0;
+                    valid_rows += 1;
+                }
+            }
+            if valid_rows == 0 {
+                return Vec::new();
+            }
+            let priors: Vec<f64> = class_counts
+                .iter()
+                .map(|&cnt| Self::ctr_clip_prob(cnt / valid_rows as f64))
+                .collect();
+            self.ordered_ctr_prior = 1.0 / n_classes as f64;
+
+            for feat in 0..n_features {
+                if feat >= self.cat_features.len() || !self.cat_features[feat] {
+                    continue;
+                }
+                let keys: Vec<i64> = (0..n_rows)
+                    .map(|row| Self::ctr_single_key(x_data[row * n_features + feat]))
+                    .collect();
+                let score = Self::ctr_multiclass_logloss_score(
+                    &keys, y, n_classes, &priors, smooth, min_count,
+                );
+                if score > 0.0 {
+                    scored.push((feat, score, keys));
+                }
+            }
+
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            scored.truncate(self.ordered_ctr_top_features.min(scored.len()));
+            if scored.is_empty() {
+                return Vec::new();
+            }
+
+            let mut rng = StdRng::seed_from_u64(self.seed ^ 0xC7A5_CE57_u64);
+            let n_perm = self.ordered_ctr_permutations.max(1);
+            let mut train_cols: Vec<Vec<f64>> = Vec::new();
+            for (feat, _score, keys) in &scored {
+                for (class_idx, &prior) in priors.iter().enumerate() {
+                    let y_binary: Vec<f64> = y
+                        .iter()
+                        .map(|&label| {
+                            if label.is_finite()
+                                && label >= 0.0
+                                && (label.round() as usize) == class_idx
+                            {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    let (enc, count, enc_map, count_map) = Self::ctr_oof_columns(
+                        keys, &y_binary, n_rows, prior, smooth, n_perm, &mut rng,
+                    );
+                    train_cols.push(enc);
+                    train_cols.push(count);
+                    self.ordered_ctr_features.push(*feat);
+                    self.ordered_ctr_priors.push(prior);
+                    self.ordered_ctr_maps.push(enc_map);
+                    self.ordered_ctr_count_maps.push(count_map);
+                }
+            }
+
+            return train_cols;
+        }
+
+        let prior = y.iter().sum::<f64>() / n_rows as f64;
+        self.ordered_ctr_prior = prior;
 
         for feat in 0..n_features {
             if feat >= self.cat_features.len() || !self.cat_features[feat] {
@@ -586,6 +1094,7 @@ impl GTBoostModel {
             single_oof_cols.push(enc.clone());
             train_cols.push(enc);
             train_cols.push(count);
+            self.ordered_ctr_priors.push(prior);
             self.ordered_ctr_maps.push(enc_map);
             self.ordered_ctr_count_maps.push(count_map);
         }
@@ -798,11 +1307,12 @@ impl GTBoostModel {
             }
             let map = &self.ordered_ctr_maps[mi];
             let count_map = self.ordered_ctr_count_maps.get(mi);
+            let col_prior = self.ordered_ctr_priors.get(mi).copied().unwrap_or(prior);
             let mut enc_col = Vec::with_capacity(n_rows);
             let mut count_col = Vec::with_capacity(n_rows);
             for row in 0..n_rows {
                 let key = Self::ctr_single_key(x_data[row * n_features + feat]);
-                enc_col.push(*map.get(&key).unwrap_or(&prior));
+                enc_col.push(*map.get(&key).unwrap_or(&col_prior));
                 count_col.push(count_map.and_then(|m| m.get(&key)).copied().unwrap_or(0.0));
             }
             cols.push(enc_col);
@@ -1022,6 +1532,45 @@ impl GTBoostModel {
         out
     }
 
+    fn binary_auc_error(eval_y: &[f64], eval_preds: &[f64], n_eval: usize) -> Option<f64> {
+        if n_eval == 0 || eval_y.len() < n_eval || eval_preds.len() < n_eval {
+            return None;
+        }
+        let mut pairs: Vec<(f64, bool)> = Vec::with_capacity(n_eval);
+        let mut pos = 0usize;
+        for i in 0..n_eval {
+            let is_pos = eval_y[i] > 0.5;
+            if is_pos {
+                pos += 1;
+            }
+            pairs.push((eval_preds[i], is_pos));
+        }
+        let neg = n_eval.saturating_sub(pos);
+        if pos == 0 || neg == 0 {
+            return None;
+        }
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut rank_sum_pos = 0.0f64;
+        let mut i = 0usize;
+        while i < n_eval {
+            let mut j = i + 1;
+            while j < n_eval && (pairs[j].0 - pairs[i].0).abs() <= 1e-12 {
+                j += 1;
+            }
+            let avg_rank = 0.5 * ((i + 1) as f64 + j as f64);
+            for item in pairs.iter().take(j).skip(i) {
+                if item.1 {
+                    rank_sum_pos += avg_rank;
+                }
+            }
+            i = j;
+        }
+        let pos_f = pos as f64;
+        let neg_f = neg as f64;
+        let auc = (rank_sum_pos - pos_f * (pos_f + 1.0) * 0.5) / (pos_f * neg_f);
+        Some(1.0 - auc.clamp(0.0, 1.0))
+    }
+
     pub(super) fn compute_eval_loss(
         &self,
         eval_y: &[f64],
@@ -1038,6 +1587,12 @@ impl GTBoostModel {
                 mse / n_eval as f64
             }
             "binary" | "rank" => {
+                let metric = self.eval_metric.to_ascii_lowercase();
+                if matches!(metric.as_str(), "auc" | "roc_auc" | "1-auc") {
+                    if let Some(err) = Self::binary_auc_error(eval_y, eval_preds, n_eval) {
+                        return err;
+                    }
+                }
                 // For rank task: raw scores are uncalibrated, but sigmoid preserves ranking.
                 // Log-loss on raw scores still decreases with better ranking → valid ES signal.
                 let mut loss = 0.0f64;
@@ -1299,12 +1854,140 @@ impl GTBoostModel {
                 false, // sparse_oblique_splits
                 false, // interval_splits
                 None,
+                false,
+                0.0, // leaf_var_shrink
                 crate::tree::CatPairConfig::default(),
+
+                                None,
+                            
+                None,
+            
+                0.0,
+            
+                0.5,
+                1.0,
             );
             tree.add_predictions_binned(binned, &mut predictions, lr);
             trees.push(tree);
         }
         trees
+    }
+
+    pub(super) fn stable_numeric_interaction_pairs(
+        &self,
+        x_data: &[f64],
+        y: &[f64],
+        n_rows: usize,
+        n_features: usize,
+        numeric_indices: &[usize],
+        max_pairs: usize,
+    ) -> Vec<((usize, usize), f64)> {
+        if n_rows < 64
+            || numeric_indices.len() < 2
+            || numeric_indices.len() > 128
+            || x_data.len() < n_rows.saturating_mul(n_features)
+        {
+            return Vec::new();
+        }
+
+        #[inline]
+        fn corr_from_sums(n: usize, sx: f64, sy: f64, sxx: f64, syy: f64, sxy: f64) -> f64 {
+            if n < 8 {
+                return 0.0;
+            }
+            let nf = n as f64;
+            let vx = (sxx - sx * sx / nf).max(0.0);
+            let vy = (syy - sy * sy / nf).max(0.0);
+            if vx <= 1e-24 || vy <= 1e-24 {
+                return 0.0;
+            }
+            (sxy - sx * sy / nf) / (vx.sqrt() * vy.sqrt())
+        }
+
+        let mut single_corr = vec![[0.0f64; 2]; n_features];
+        for &feat in numeric_indices {
+            for fold in 0..2usize {
+                let mut n = 0usize;
+                let mut sx = 0.0;
+                let mut sy = 0.0;
+                let mut sxx = 0.0;
+                let mut syy = 0.0;
+                let mut sxy = 0.0;
+                for row in (fold..n_rows).step_by(2) {
+                    let x = x_data[row * n_features + feat];
+                    let yy = y[row];
+                    if !x.is_finite() || !yy.is_finite() {
+                        continue;
+                    }
+                    n += 1;
+                    sx += x;
+                    sy += yy;
+                    sxx += x * x;
+                    syy += yy * yy;
+                    sxy += x * yy;
+                }
+                single_corr[feat][fold] = corr_from_sums(n, sx, sy, sxx, syy, sxy);
+            }
+        }
+
+        let mut scored: Vec<((usize, usize), f64)> = Vec::new();
+        for a_pos in 0..numeric_indices.len() {
+            let fa = numeric_indices[a_pos];
+            for &fb in numeric_indices.iter().skip(a_pos + 1) {
+                let mut prod_corr = [0.0f64; 2];
+                for (fold, slot) in prod_corr.iter_mut().enumerate() {
+                    let mut n = 0usize;
+                    let mut sx = 0.0;
+                    let mut sy = 0.0;
+                    let mut sxx = 0.0;
+                    let mut syy = 0.0;
+                    let mut sxy = 0.0;
+                    for row in (fold..n_rows).step_by(2) {
+                        let xa = x_data[row * n_features + fa];
+                        let xb = x_data[row * n_features + fb];
+                        let yy = y[row];
+                        if !xa.is_finite() || !xb.is_finite() || !yy.is_finite() {
+                            continue;
+                        }
+                        let x = xa * xb;
+                        if !x.is_finite() {
+                            continue;
+                        }
+                        n += 1;
+                        sx += x;
+                        sy += yy;
+                        sxx += x * x;
+                        syy += yy * yy;
+                        sxy += x * yy;
+                    }
+                    *slot = corr_from_sums(n, sx, sy, sxx, syy, sxy);
+                }
+                if prod_corr[0] * prod_corr[1] <= 0.0 {
+                    continue;
+                }
+                let surplus0 =
+                    prod_corr[0].abs() - single_corr[fa][0].abs().max(single_corr[fb][0].abs());
+                let surplus1 =
+                    prod_corr[1].abs() - single_corr[fa][1].abs().max(single_corr[fb][1].abs());
+                let min_surplus = surplus0.min(surplus1);
+                if min_surplus <= 0.025 {
+                    continue;
+                }
+                let mean_abs = 0.5 * (prod_corr[0].abs() + prod_corr[1].abs());
+                let score = min_surplus * mean_abs;
+                if score.is_finite() && score > 0.0 {
+                    scored.push(((fa.min(fb), fa.max(fb)), score));
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored.truncate(max_pairs.max(1));
+        scored
     }
 
     pub(super) fn compute_gradients_hessians(
@@ -1318,7 +2001,11 @@ impl GTBoostModel {
         let use_par = n >= 4096;
         match self.task.as_str() {
             "regression" => {
-                let delta = self.huber_delta;
+                let delta = if self.huber_delta < 0.0 {
+                    Self::adaptive_huber_delta(y, preds)
+                } else {
+                    self.huber_delta
+                };
                 if delta > 0.0 {
                     if use_par {
                         gradients
@@ -1420,119 +2107,182 @@ impl GTBoostModel {
                             hessians[i] = w * focus * (p * (1.0 - p)).max(1e-16);
                         }
                     } else {
-                        // Histogram pairwise AUC surrogate: approximate the all-pairs RankNet
-                        // gradient against the opposite-class score distribution in O(n+B^2).
-                        let mut lo = f64::INFINITY;
-                        let mut hi = f64::NEG_INFINITY;
-                        let mut sum = 0.0f64;
-                        let mut sum_sq = 0.0f64;
-                        let mut finite_n = 0usize;
-                        for &z in preds {
-                            if z.is_finite() {
-                                lo = lo.min(z);
-                                hi = hi.max(z);
-                                sum += z;
-                                sum_sq += z * z;
-                                finite_n += 1;
+                        let pair_count = (pos_count as u128) * (neg_count as u128);
+                        if pair_count <= 2_000_000 {
+                            let pair_temp = self.rank_pair_temperature.max(0.05);
+                            let inv_temp = 1.0 / pair_temp;
+                            let inv_temp_sq = inv_temp * inv_temp;
+                            let mut rank_g = vec![0.0f64; n];
+                            let mut rank_h = vec![0.0f64; n];
+                            let mut pos_idx: Vec<usize> = Vec::with_capacity(pos_count);
+                            let mut neg_idx: Vec<usize> = Vec::with_capacity(neg_count);
+                            for i in 0..n {
+                                if y[i] > 0.5 {
+                                    pos_idx.push(i);
+                                } else {
+                                    neg_idx.push(i);
+                                }
                             }
-                        }
-                        if finite_n == 0 {
-                            lo = -1.0;
-                            hi = 1.0;
+                            let pos_total = pos_count as f64;
+                            let neg_total = neg_count as f64;
+                            for &pi in &pos_idx {
+                                let zp = preds[pi];
+                                let mut gp = 0.0f64;
+                                let mut hp = 0.0f64;
+                                for &ni in &neg_idx {
+                                    let d = ((zp - preds[ni]) * inv_temp).clamp(-50.0, 50.0);
+                                    let s = 1.0 / (1.0 + (-d).exp());
+                                    let h = (s * (1.0 - s)).max(1e-16);
+                                    gp += s - 1.0;
+                                    hp += h;
+                                    rank_g[ni] += 1.0 - s;
+                                    rank_h[ni] += h;
+                                }
+                                rank_g[pi] = inv_temp * gp / neg_total;
+                                rank_h[pi] = (inv_temp_sq * hp / neg_total).max(1e-16);
+                            }
+                            for &ni in &neg_idx {
+                                rank_g[ni] = inv_temp * rank_g[ni] / pos_total;
+                                rank_h[ni] = (inv_temp_sq * rank_h[ni] / pos_total).max(1e-16);
+                            }
+
+                            let one_minus_a = 1.0 - alpha;
+                            for i in 0..n {
+                                let z = preds[i].clamp(-50.0, 50.0);
+                                let p = 1.0 / (1.0 + (-z).exp());
+                                let g_log = p - y[i];
+                                let h_log = (p * (1.0 - p)).max(1e-16);
+                                let w = if y[i] > 0.5 { pos_weight } else { neg_weight };
+                                let focus = if focus_gamma > 0.0 {
+                                    let err = if y[i] > 0.5 { 1.0 - p } else { p };
+                                    (2.0 * err.clamp(0.0, 1.0)).powf(focus_gamma)
+                                } else {
+                                    1.0
+                                };
+                                gradients[i] =
+                                    w * focus * (one_minus_a * g_log + alpha * rank_g[i]);
+                                hessians[i] = w
+                                    * focus
+                                    * (one_minus_a * h_log + alpha * rank_h[i]).max(1e-16);
+                            }
                         } else {
-                            let mean = sum / finite_n as f64;
-                            let var = (sum_sq / finite_n as f64 - mean * mean).max(0.0);
-                            let std = var.sqrt();
-                            if std.is_finite() && std > 1e-12 {
-                                lo = lo.max(mean - 8.0 * std);
-                                hi = hi.min(mean + 8.0 * std);
-                            }
-                            if !lo.is_finite() || !hi.is_finite() || hi <= lo + 1e-12 {
-                                lo = mean - 1.0;
-                                hi = mean + 1.0;
-                            }
-                        }
-                        let scale = (RANK_BINS as f64 - 1.0) / (hi - lo).max(1e-12);
-                        let bin_of = |z: f64| -> usize {
-                            if !z.is_finite() {
-                                return RANK_BINS / 2;
-                            }
-                            (((z.clamp(lo, hi) - lo) * scale).round() as isize)
-                                .clamp(0, RANK_BINS as isize - 1)
-                                as usize
-                        };
-
-                        let mut pos_hist = vec![0.0f64; RANK_BINS];
-                        let mut neg_hist = vec![0.0f64; RANK_BINS];
-                        for i in 0..n {
-                            let b = bin_of(preds[i]);
-                            if y[i] > 0.5 {
-                                pos_hist[b] += 1.0;
-                            } else {
-                                neg_hist[b] += 1.0;
-                            }
-                        }
-
-                        let pos_total = pos_count as f64;
-                        let neg_total = neg_count as f64;
-                        let mut rank_g_pos = vec![0.0f64; RANK_BINS];
-                        let mut rank_h_pos = vec![0.0f64; RANK_BINS];
-                        let mut rank_g_neg = vec![0.0f64; RANK_BINS];
-                        let mut rank_h_neg = vec![0.0f64; RANK_BINS];
-                        let inv_scale = 1.0 / scale;
-
-                        for b in 0..RANK_BINS {
-                            let z = lo + b as f64 * inv_scale;
-                            let mut s_neg = 0.0f64;
-                            let mut h_neg = 0.0f64;
-                            let mut s_pos = 0.0f64;
-                            let mut h_pos = 0.0f64;
-                            for c in 0..RANK_BINS {
-                                let zc = lo + c as f64 * inv_scale;
-                                let d = (z - zc).clamp(-50.0, 50.0);
-                                let s = 1.0 / (1.0 + (-d).exp());
-                                let h = (s * (1.0 - s)).max(1e-16);
-                                let nc = neg_hist[c];
-                                if nc > 0.0 {
-                                    s_neg += nc * s;
-                                    h_neg += nc * h;
-                                }
-                                let pc = pos_hist[c];
-                                if pc > 0.0 {
-                                    s_pos += pc * s;
-                                    h_pos += pc * h;
+                            // Histogram pairwise AUC surrogate: approximate the all-pairs RankNet
+                            // gradient against the opposite-class score distribution in O(n+B^2).
+                            let mut lo = f64::INFINITY;
+                            let mut hi = f64::NEG_INFINITY;
+                            let mut sum = 0.0f64;
+                            let mut sum_sq = 0.0f64;
+                            let mut finite_n = 0usize;
+                            for &z in preds {
+                                if z.is_finite() {
+                                    lo = lo.min(z);
+                                    hi = hi.max(z);
+                                    sum += z;
+                                    sum_sq += z * z;
+                                    finite_n += 1;
                                 }
                             }
-                            rank_g_pos[b] = s_neg / neg_total - 1.0;
-                            rank_h_pos[b] = (h_neg / neg_total).max(1e-16);
-                            rank_g_neg[b] = s_pos / pos_total;
-                            rank_h_neg[b] = (h_pos / pos_total).max(1e-16);
-                        }
+                            if finite_n == 0 {
+                                lo = -1.0;
+                                hi = 1.0;
+                            } else {
+                                let mean = sum / finite_n as f64;
+                                let var = (sum_sq / finite_n as f64 - mean * mean).max(0.0);
+                                let std = var.sqrt();
+                                if std.is_finite() && std > 1e-12 {
+                                    lo = lo.max(mean - 8.0 * std);
+                                    hi = hi.min(mean + 8.0 * std);
+                                }
+                                if !lo.is_finite() || !hi.is_finite() || hi <= lo + 1e-12 {
+                                    lo = mean - 1.0;
+                                    hi = mean + 1.0;
+                                }
+                            }
+                            let scale = (RANK_BINS as f64 - 1.0) / (hi - lo).max(1e-12);
+                            let bin_of = |z: f64| -> usize {
+                                if !z.is_finite() {
+                                    return RANK_BINS / 2;
+                                }
+                                (((z.clamp(lo, hi) - lo) * scale).round() as isize)
+                                    .clamp(0, RANK_BINS as isize - 1)
+                                    as usize
+                            };
 
-                        let one_minus_a = 1.0 - alpha;
-                        for i in 0..n {
-                            // Log-loss component
-                            let z = preds[i].clamp(-50.0, 50.0);
-                            let p = 1.0 / (1.0 + (-z).exp());
-                            let g_log = p - y[i];
-                            let h_log = (p * (1.0 - p)).max(1e-16);
-                            let b = bin_of(preds[i]);
-                            let (g_rank, h_rank) = if y[i] > 0.5 {
-                                (rank_g_pos[b], rank_h_pos[b])
-                            } else {
-                                (rank_g_neg[b], rank_h_neg[b])
-                            };
-                            // Blend
-                            let w = if y[i] > 0.5 { pos_weight } else { neg_weight };
-                            let focus = if focus_gamma > 0.0 {
-                                let err = if y[i] > 0.5 { 1.0 - p } else { p };
-                                (2.0 * err.clamp(0.0, 1.0)).powf(focus_gamma)
-                            } else {
-                                1.0
-                            };
-                            gradients[i] = w * focus * (one_minus_a * g_log + alpha * g_rank);
-                            hessians[i] =
-                                w * focus * (one_minus_a * h_log + alpha * h_rank).max(1e-16);
+                            let mut pos_hist = vec![0.0f64; RANK_BINS];
+                            let mut neg_hist = vec![0.0f64; RANK_BINS];
+                            for i in 0..n {
+                                let b = bin_of(preds[i]);
+                                if y[i] > 0.5 {
+                                    pos_hist[b] += 1.0;
+                                } else {
+                                    neg_hist[b] += 1.0;
+                                }
+                            }
+
+                            let pos_total = pos_count as f64;
+                            let neg_total = neg_count as f64;
+                            let mut rank_g_pos = vec![0.0f64; RANK_BINS];
+                            let mut rank_h_pos = vec![0.0f64; RANK_BINS];
+                            let mut rank_g_neg = vec![0.0f64; RANK_BINS];
+                            let mut rank_h_neg = vec![0.0f64; RANK_BINS];
+                            let inv_scale = 1.0 / scale;
+                            let pair_temp = self.rank_pair_temperature.max(0.05);
+                            let inv_temp = 1.0 / pair_temp;
+                            let inv_temp_sq = inv_temp * inv_temp;
+
+                            for b in 0..RANK_BINS {
+                                let z = lo + b as f64 * inv_scale;
+                                let mut s_neg = 0.0f64;
+                                let mut h_neg = 0.0f64;
+                                let mut s_pos = 0.0f64;
+                                let mut h_pos = 0.0f64;
+                                for c in 0..RANK_BINS {
+                                    let zc = lo + c as f64 * inv_scale;
+                                    let d = ((z - zc) * inv_temp).clamp(-50.0, 50.0);
+                                    let s = 1.0 / (1.0 + (-d).exp());
+                                    let h = (s * (1.0 - s)).max(1e-16);
+                                    let nc = neg_hist[c];
+                                    if nc > 0.0 {
+                                        s_neg += nc * s;
+                                        h_neg += nc * h;
+                                    }
+                                    let pc = pos_hist[c];
+                                    if pc > 0.0 {
+                                        s_pos += pc * s;
+                                        h_pos += pc * h;
+                                    }
+                                }
+                                rank_g_pos[b] = inv_temp * (s_neg / neg_total - 1.0);
+                                rank_h_pos[b] = (inv_temp_sq * h_neg / neg_total).max(1e-16);
+                                rank_g_neg[b] = inv_temp * s_pos / pos_total;
+                                rank_h_neg[b] = (inv_temp_sq * h_pos / pos_total).max(1e-16);
+                            }
+
+                            let one_minus_a = 1.0 - alpha;
+                            for i in 0..n {
+                                // Log-loss component
+                                let z = preds[i].clamp(-50.0, 50.0);
+                                let p = 1.0 / (1.0 + (-z).exp());
+                                let g_log = p - y[i];
+                                let h_log = (p * (1.0 - p)).max(1e-16);
+                                let b = bin_of(preds[i]);
+                                let (g_rank, h_rank) = if y[i] > 0.5 {
+                                    (rank_g_pos[b], rank_h_pos[b])
+                                } else {
+                                    (rank_g_neg[b], rank_h_neg[b])
+                                };
+                                // Blend
+                                let w = if y[i] > 0.5 { pos_weight } else { neg_weight };
+                                let focus = if focus_gamma > 0.0 {
+                                    let err = if y[i] > 0.5 { 1.0 - p } else { p };
+                                    (2.0 * err.clamp(0.0, 1.0)).powf(focus_gamma)
+                                } else {
+                                    1.0
+                                };
+                                gradients[i] = w * focus * (one_minus_a * g_log + alpha * g_rank);
+                                hessians[i] =
+                                    w * focus * (one_minus_a * h_log + alpha * h_rank).max(1e-16);
+                            }
                         }
                     }
                 } else if use_par {
@@ -2101,6 +2851,10 @@ impl GTBoostModel {
         }
         let mut sum_g: Vec<f64> = Vec::new();
         let mut sum_h: Vec<f64> = Vec::new();
+        let mut fold_g: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut fold_h: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut fold_total_g = [0.0f64; 2];
+        let mut fold_total_h = [0.0f64; 2];
         let mut total_g = 0.0f64;
         let mut total_h = 0.0f64;
         let offset = feature * binned.n_rows;
@@ -2116,6 +2870,10 @@ impl GTBoostModel {
                 }
                 sum_g.resize(b + 1, 0.0);
                 sum_h.resize(b + 1, 0.0);
+                fold_g[0].resize(b + 1, 0.0);
+                fold_g[1].resize(b + 1, 0.0);
+                fold_h[0].resize(b + 1, 0.0);
+                fold_h[1].resize(b + 1, 0.0);
             }
             let g = gradients[row];
             let h = hessians[row].max(1e-12);
@@ -2123,6 +2881,14 @@ impl GTBoostModel {
             sum_h[b] += h;
             total_g += g;
             total_h += h;
+            let mut hash = ((row as u64).wrapping_mul(0xD6E8_FD9D_50D5_1735))
+                ^ ((feature as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            hash ^= hash >> 33;
+            let fold = (hash as usize) & 1;
+            fold_g[fold][b] += g;
+            fold_h[fold][b] += h;
+            fold_total_g[fold] += g;
+            fold_total_h[fold] += h;
         }
         if total_h <= 1e-12 || sum_g.len() <= 1 {
             return 0.0;
@@ -2135,11 +2901,42 @@ impl GTBoostModel {
             }
         }
         score -= (total_g * total_g) / (total_h + lam);
-        if score.is_finite() {
-            score.max(0.0)
-        } else {
-            0.0
+        if !score.is_finite() || score <= 0.0 {
+            return 0.0;
         }
+        let full_pressure = score;
+        if self.split_pessimism <= 0.0 || binned.n_rows < 64 {
+            return full_pressure;
+        }
+
+        let mut fold_pressure = [0.0f64; 2];
+        for fold in 0..2 {
+            if fold_total_h[fold] <= 1e-12 {
+                return full_pressure;
+            }
+            let mut fp = 0.0f64;
+            for b in 0..fold_g[fold].len() {
+                let bh = fold_h[fold][b];
+                if bh > 1e-12 {
+                    fp += (fold_g[fold][b] * fold_g[fold][b]) / (bh + lam);
+                }
+            }
+            fp -= (fold_total_g[fold] * fold_total_g[fold]) / (fold_total_h[fold] + lam);
+            if !fp.is_finite() || fp <= 0.0 {
+                fold_pressure[fold] = 0.0;
+            } else {
+                fold_pressure[fold] = fp;
+            }
+        }
+        let stable_full_equiv = 2.0 * fold_pressure[0].min(fold_pressure[1]);
+        if stable_full_equiv <= 0.0 {
+            return full_pressure * (1.0 - self.split_pessimism.clamp(0.0, 0.5));
+        }
+        let stability = (stable_full_equiv / (full_pressure + 1e-12)).clamp(0.0, 1.0);
+        let width = (sum_g.len().max(2) as f64).ln().max(1.0);
+        let shrink = (1.0 - self.split_pessimism.clamp(0.0, 0.5) * width * (1.0 - stability))
+            .clamp(0.35, 1.0);
+        full_pressure.min(stable_full_equiv) * shrink
     }
 
     pub(super) fn cyclic_feature_order_by_pressure(
@@ -2165,6 +2962,113 @@ impl GTBoostModel {
         scored.into_iter().map(|(f, _)| f).collect()
     }
 
+    pub(super) fn pressure_effective_dimension(
+        &self,
+        binned: &BinnedData,
+        gradients: &[f64],
+        hessians: &[f64],
+        lambda: f64,
+    ) -> f64 {
+        if binned.n_features == 0 {
+            return 0.0;
+        }
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for feature in 0..binned.n_features {
+            let p = self
+                .cyclic_feature_pressure(binned, feature, gradients, hessians, lambda)
+                .max(0.0);
+            if p > 0.0 && p.is_finite() {
+                sum += p;
+                sum_sq += p * p;
+            }
+        }
+        if sum <= 0.0 || sum_sq <= 0.0 {
+            0.0
+        } else {
+            (sum * sum / sum_sq).clamp(1.0, binned.n_features.max(1) as f64)
+        }
+    }
+
+    pub(super) fn adaptive_subtree_count_by_pressure(
+        &self,
+        binned: &BinnedData,
+        gradients: &[f64],
+        hessians: &[f64],
+        lambda: f64,
+        requested: usize,
+    ) -> usize {
+        if requested <= 1 || binned.n_features <= 1 {
+            return requested.max(1);
+        }
+        let eff_dim = self.pressure_effective_dimension(binned, gradients, hessians, lambda);
+        if eff_dim <= 1.0 {
+            return 1;
+        }
+        let supported = (eff_dim / 2.0).sqrt().floor() as usize;
+        supported.clamp(1, requested)
+    }
+
+    pub(super) fn main_effect_from_scored_pressures(
+        &self,
+        mut scored: Vec<(usize, f64)>,
+        excluded_feature: Option<usize>,
+    ) -> Option<usize> {
+        scored.retain(|(f, s)| Some(*f) != excluded_feature && s.is_finite() && *s > 0.0);
+        if scored.is_empty() {
+            return None;
+        }
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let total: f64 = scored.iter().map(|(_, s)| *s).sum();
+        if !total.is_finite() || total <= 1e-12 {
+            return None;
+        }
+        let best = scored[0].1;
+        let second = scored.get(1).map(|(_, s)| *s).unwrap_or(0.0);
+        let n_eff = scored.len().max(1) as f64;
+        let share = best / total;
+        let ratio = best / (second + 1e-12);
+        let min_share = (2.0 / n_eff).clamp(0.045, 0.22);
+        let absolute_floor = self.gamma.max(0.0) + 1e-12;
+
+        if best > absolute_floor && ((share >= min_share && ratio >= 1.03) || ratio >= 1.75) {
+            Some(scored[0].0)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn main_effect_feature_by_pressure(
+        &self,
+        binned: &BinnedData,
+        gradients: &[f64],
+        hessians: &[f64],
+        lambda: f64,
+        excluded_feature: Option<usize>,
+    ) -> Option<usize> {
+        let scored: Vec<(usize, f64)> = (0..binned.n_features)
+            .map(|f| {
+                (
+                    f,
+                    self.cyclic_feature_pressure(binned, f, gradients, hessians, lambda),
+                )
+            })
+            .collect();
+        self.main_effect_from_scored_pressures(scored, excluded_feature)
+    }
+
+    pub(super) fn main_effect_due(&self, round: usize, n_rounds: usize) -> bool {
+        if self.main_effect_interval == 0 {
+            return false;
+        }
+        let _ = n_rounds;
+        (round + 1) % self.main_effect_interval == 0
+    }
+
     pub(super) fn cyclic_revisit_budget(&self) -> usize {
         if !self.cyclic_feature_reuse {
             return 0;
@@ -2173,6 +3077,22 @@ impl GTBoostModel {
             self.cyclic_revisit_trees.min(16)
         } else {
             self.n_trees_per_round.max(1).min(16)
+        }
+    }
+
+    pub(super) fn subtrees_per_boosting_round(&self, n_feat: usize) -> usize {
+        if !self.cyclic_features {
+            return self.n_trees_per_round.max(1);
+        }
+        let base = if self.cyclic_max_features_per_round > 0 {
+            self.cyclic_max_features_per_round.min(n_feat).max(1)
+        } else {
+            n_feat.max(1)
+        };
+        if self.adaptive_cyclic_order && self.cyclic_feature_reuse {
+            base + self.cyclic_revisit_budget()
+        } else {
+            base
         }
     }
 
@@ -2269,7 +3189,37 @@ impl GTBoostModel {
         if active < 2 {
             return 0.0;
         }
-        score -= (total_g * total_g) / (total_h + lam);
+        // FAST-style INTERACTION-PURE score: subtract both marginal (1-D) scores
+        // computed on the same grid, so the pair score measures joint structure
+        // BEYOND what either feature's own shape already explains. Without this
+        // the partner choice is dominated by strong-main features, which the
+        // cyclic mains fit anyway (verified inert on real data).
+        let mut row_g = vec![0.0f64; n_bins];
+        let mut row_h = vec![0.0f64; n_bins];
+        let mut col_g = vec![0.0f64; n_bins];
+        let mut col_h = vec![0.0f64; n_bins];
+        for a in 0..n_bins {
+            for b in 0..n_bins {
+                let cell = a * n_bins + b;
+                row_g[a] += sum_g[cell];
+                row_h[a] += sum_h[cell];
+                col_g[b] += sum_g[cell];
+                col_h[b] += sum_h[cell];
+            }
+        }
+        let parent = (total_g * total_g) / (total_h + lam);
+        let marginal = |gs: &[f64], hs: &[f64]| -> f64 {
+            let mut s = 0.0f64;
+            for k in 0..n_bins {
+                if hs[k] > 1e-12 {
+                    s += (gs[k] * gs[k]) / (hs[k] + lam);
+                }
+            }
+            (s - parent).max(0.0)
+        };
+        score -= parent;
+        score -= marginal(&row_g, &row_h);
+        score -= marginal(&col_g, &col_h);
         if score.is_finite() {
             score.max(0.0)
         } else {
@@ -3334,6 +4284,7 @@ impl GTBoostModel {
 
         let mut build_samples = vec![Vec::<u32>::new(); n_nodes];
         let mut cal_samples = vec![Vec::<u32>::new(); n_nodes];
+        let path_features = tree.compute_path_features_k(k.max(1));
         for &idx in build_indices {
             let leaf = tree.route_to_leaf(binned, idx as usize);
             build_samples[leaf].push(idx);
@@ -3356,6 +4307,22 @@ impl GTBoostModel {
             let cal = &cal_samples[node];
             if build.len() < self.expert_min_leaf || cal.len() < self.expert_min_cal {
                 continue;
+            }
+
+            let mut path_candidate_features: Vec<usize> = Vec::new();
+            let base = node * k;
+            for j in 0..k {
+                let feat = path_features.get(base + j).copied().unwrap_or(u32::MAX);
+                if feat == u32::MAX {
+                    continue;
+                }
+                let feat = feat as usize;
+                if feat < binned.n_features
+                    && !binned.is_categorical.get(feat).copied().unwrap_or(false)
+                    && !path_candidate_features.contains(&feat)
+                {
+                    path_candidate_features.push(feat);
+                }
             }
 
             let mut scored: Vec<(f64, usize, f64, f64)> = Vec::new();
@@ -3494,7 +4461,17 @@ impl GTBoostModel {
                 var /= (diffs.len() - 1) as f64;
             }
             let sd = var.sqrt();
-            let p_eff = p as f64 * (1.0 + (numeric_features.len() as f64 + 1.0).ln());
+            let selected_are_path_local = !path_candidate_features.is_empty()
+                && scored
+                    .iter()
+                    .take(p)
+                    .all(|&(_, feat, _, _)| path_candidate_features.contains(&feat));
+            let search_width = if selected_are_path_local {
+                path_candidate_features.len()
+            } else {
+                numeric_features.len()
+            };
+            let p_eff = p as f64 * (1.0 + (search_width as f64 + 1.0).ln());
             let penalty = self.expert_se_multiplier * (diffs.len() as f64).sqrt() * sd
                 + self.expert_param_penalty * p_eff
                 + self.expert_epsilon;
@@ -3621,4 +4598,909 @@ impl GTBoostModel {
             tree.ramp_slopes = ramp_slopes;
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // CFE: Categorical Fold Evidence — native fast tuple-posterior features.
+    //
+    // For selected categorical tuples (singles + utility-screened pairs and
+    // triples), build target-statistic tables and emit per-row evidence
+    // columns. Train rows get CROSS-FIT values (table minus the row's fold):
+    // leak-safe like CatBoost's ordered TS but deterministic — no permutation
+    // noise and no cold-start prefix rows. Eval/predict rows use the full
+    // table. A PACT-style naive-Bayes aggregate compresses all tuples into a
+    // handful of combined-evidence columns trees cannot reconstruct from the
+    // individual lifts.
+    // ════════════════════════════════════════════════════════════════════
+
+    #[inline]
+    fn cfe_mix(h: u64, v: u64) -> u64 {
+        let mut z = h ^ v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn cfe_keys(x: &[f64], n_rows: usize, n_features: usize, feats: &[usize]) -> Vec<i64> {
+        (0..n_rows)
+            .map(|row| {
+                let mut h: u64 = 0x51_7C_C1_B7;
+                for &f in feats {
+                    let v = x[row * n_features + f];
+                    if !v.is_finite() {
+                        return i64::MIN;
+                    }
+                    h = Self::cfe_mix(h, (v.round() as i64) as u64);
+                }
+                (h >> 1) as i64
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn cfe_logit(p: f64) -> f64 {
+        let p = p.clamp(1e-6, 1.0 - 1e-6);
+        (p / (1.0 - p)).ln()
+    }
+
+    fn cfe_arity_clip(arity: usize) -> f64 {
+        // EA-evolved schedule (cfe_equation_ea_lab, LODO-selected on kdd):
+        // clip_base 3.605 * 0.7486^(arity-1).
+        match arity {
+            1 => 3.605,
+            2 => 2.699,
+            _ => 2.020,
+        }
+    }
+
+    /// OOF predictive utility: build the candidate's CROSS-FIT lift column
+    /// and score its honest squared correlation with the target. Memorizing
+    /// junk keys self-eliminates (their out-of-fold lift is noise), so no
+    /// key-count penalty is needed — this replaces the in-sample chi2 +
+    /// ln(keys) band-aid and makes WIDE candidate pools safe.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    fn cfe_tuple_score_oof(
+        keys: &[i64],
+        targets: &[f64],
+        n_out: usize,
+        prior: &[f64],
+        m: f64,
+        fold_of: &[u8],
+        n_folds: usize,
+    ) -> f64 {
+        let n_rows = keys.len();
+        let mut idx: HashMap<i64, usize> = HashMap::new();
+        let mut cnt: Vec<f64> = Vec::new();
+        let mut sums: Vec<f64> = Vec::new();
+        let mut fcnt: Vec<f64> = Vec::new();
+        let mut fsums: Vec<f64> = Vec::new();
+        for (row, &key) in keys.iter().enumerate() {
+            if key == i64::MIN {
+                continue;
+            }
+            let ki = *idx.entry(key).or_insert_with(|| {
+                cnt.push(0.0);
+                sums.extend(std::iter::repeat(0.0).take(n_out));
+                fcnt.extend(std::iter::repeat(0.0).take(n_folds));
+                fsums.extend(std::iter::repeat(0.0).take(n_folds * n_out));
+                cnt.len() - 1
+            });
+            let f = fold_of[row] as usize;
+            cnt[ki] += 1.0;
+            fcnt[ki * n_folds + f] += 1.0;
+            for o in 0..n_out {
+                let t = targets[row * n_out + o];
+                sums[ki * n_out + o] += t;
+                fsums[(ki * n_folds + f) * n_out + o] += t;
+            }
+        }
+        if idx.len() < 2 {
+            return 0.0;
+        }
+        // Honest squared correlation summed over outputs.
+        let mut score = 0.0f64;
+        for o in 0..n_out {
+            let mut sxy = 0.0f64;
+            let mut sxx = 0.0f64;
+            let mut syy = 0.0f64;
+            for (row, &key) in keys.iter().enumerate() {
+                if key == i64::MIN {
+                    continue;
+                }
+                let ki = idx[&key];
+                let f = fold_of[row] as usize;
+                let c = cnt[ki] - fcnt[ki * n_folds + f];
+                let s_ = sums[ki * n_out + o] - fsums[(ki * n_folds + f) * n_out + o];
+                let lift = (s_ + m * prior[o]) / (c + m) - prior[o];
+                let yv = targets[row * n_out + o] - prior[o];
+                sxy += lift * yv;
+                sxx += lift * lift;
+                syy += yv * yv;
+            }
+            if sxx > 1e-12 && syy > 1e-12 {
+                score += (sxy * sxy) / (sxx * syy);
+            }
+        }
+        score
+    }
+
+    /// Chi2-like utility of a keyed tuple against per-output targets.
+    fn cfe_tuple_score(
+        keys: &[i64],
+        targets: &[f64],
+        n_out: usize,
+        prior: &[f64],
+        m: f64,
+    ) -> f64 {
+        let mut idx: HashMap<i64, usize> = HashMap::new();
+        let mut cnt: Vec<f64> = Vec::new();
+        let mut sums: Vec<f64> = Vec::new();
+        for (row, &key) in keys.iter().enumerate() {
+            if key == i64::MIN {
+                continue;
+            }
+            let ki = *idx.entry(key).or_insert_with(|| {
+                cnt.push(0.0);
+                sums.extend(std::iter::repeat(0.0).take(n_out));
+                cnt.len() - 1
+            });
+            cnt[ki] += 1.0;
+            for o in 0..n_out {
+                sums[ki * n_out + o] += targets[row * n_out + o];
+            }
+        }
+        if idx.len() < 2 {
+            return 0.0;
+        }
+        let mut score = 0.0f64;
+        for ki in 0..cnt.len() {
+            let c = cnt[ki];
+            for o in 0..n_out {
+                let d = sums[ki * n_out + o] - c * prior[o];
+                score += d * d / (c + m);
+            }
+        }
+        // Penalize raw key count (search width / memorization pressure).
+        // EA-evolved: weaker key-count penalty keeps high-card crosses (pi=0.539).
+        score / (1.0 + (idx.len() as f64).ln()).powf(0.539)
+    }
+
+    /// Fit CFE tables and return TRAIN evidence columns (cross-fit values).
+    pub(super) fn build_cat_fold_evidence(
+        &mut self,
+        x_data: &[f64],
+        y: &[f64],
+        n_rows: usize,
+        n_features: usize,
+    ) -> Vec<Vec<f64>> {
+        self.cfe_tuples.clear();
+        self.cfe_tables.clear();
+        self.cfe_prior.clear();
+        self.cfe_n_out = 0;
+        if !self.cat_fold_evidence || n_rows < 40 {
+            return Vec::new();
+        }
+        let cat_cols: Vec<usize> = (0..n_features)
+            .filter(|&f| f < self.cat_features.len() && self.cat_features[f])
+            .collect();
+        if cat_cols.is_empty() {
+            return Vec::new();
+        }
+        // Targets: binary/regression -> 1 output; multiclass -> one-hot K.
+        let (n_out, targets): (usize, Vec<f64>) = if self.task == "multiclass" {
+            let k = y
+                .iter()
+                .filter(|v| v.is_finite() && **v >= 0.0)
+                .map(|&v| v.round() as usize)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            if k < 2 {
+                return Vec::new();
+            }
+            let mut t = vec![0.0f64; n_rows * k];
+            for (row, &yv) in y.iter().enumerate().take(n_rows) {
+                let c = (yv.round() as usize).min(k - 1);
+                t[row * k + c] = 1.0;
+            }
+            (k, t)
+        } else {
+            (1, y[..n_rows].to_vec())
+        };
+        let mut prior = vec![0.0f64; n_out];
+        for row in 0..n_rows {
+            for o in 0..n_out {
+                prior[o] += targets[row * n_out + o];
+            }
+        }
+        for p in prior.iter_mut() {
+            *p /= n_rows as f64;
+        }
+        let m = self.cfe_smooth.max(1e-6);
+        let is_reg = self.task != "binary" && self.task != "multiclass";
+
+        // ── Cross-fit fold assignment (shared by selection + tables) ──
+        let n_folds = self.cfe_folds.clamp(2, 16).min(n_rows / 8).max(2);
+        let fold_of: Vec<u8> = {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            let mut rng = StdRng::seed_from_u64(self.seed.wrapping_add(0xCFE));
+            perm.shuffle(&mut rng);
+            let mut fo = vec![0u8; n_rows];
+            for (rank, &row) in perm.iter().enumerate() {
+                fo[row] = (rank % n_folds) as u8;
+            }
+            fo
+        };
+
+        // ── Tuple selection (EA-tuned in-sample screen; an OOF-utility screen
+        // was built and A/B-tested 2026-06-10 and LOST on both kdd and Amazon —
+        // the chi2 + ln(keys)^0.539 form stays) ──
+        let mut singles: Vec<(f64, usize, Vec<i64>)> = cat_cols
+            .par_iter()
+            .map(|&f| {
+                let keys = Self::cfe_keys(x_data, n_rows, n_features, &[f]);
+                let s = Self::cfe_tuple_score(&keys, &targets, n_out, &prior, m);
+                (s, f, keys)
+            })
+            .collect();
+        singles.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        singles.retain(|(s, _, _)| *s > 0.0);
+        // Encode ALL useful singles (CatBoost encodes every cat feature; a low
+        // cap was the loss driver on wide-categorical data like kdd_internet).
+        singles.truncate(64);
+        if singles.is_empty() {
+            return Vec::new();
+        }
+        let mut tuples: Vec<Vec<usize>> = singles.iter().map(|(_, f, _)| vec![*f]).collect();
+        let top_feats: Vec<usize> = singles.iter().take(12).map(|(_, f, _)| *f).collect();
+        if self.cfe_max_pairs > 0 && top_feats.len() >= 2 {
+            let mut cands: Vec<(usize, usize)> = Vec::new();
+            for i in 0..top_feats.len() {
+                for j in (i + 1)..top_feats.len() {
+                    cands.push((top_feats[i], top_feats[j]));
+                }
+            }
+            let mut scored: Vec<(f64, Vec<usize>)> = cands
+                .par_iter()
+                .map(|&(a, b)| {
+                    let keys = Self::cfe_keys(x_data, n_rows, n_features, &[a, b]);
+                    (
+                        Self::cfe_tuple_score(&keys, &targets, n_out, &prior, m),
+                        vec![a, b],
+                    )
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (s, t) in scored.into_iter().take(self.cfe_max_pairs) {
+                if s > 0.0 {
+                    tuples.push(t);
+                }
+            }
+        }
+        if self.cfe_max_triples > 0 && top_feats.len() >= 3 {
+            let base: Vec<usize> = top_feats.iter().take(6).copied().collect();
+            let mut cands: Vec<Vec<usize>> = Vec::new();
+            for i in 0..base.len() {
+                for j in (i + 1)..base.len() {
+                    for l in (j + 1)..base.len() {
+                        cands.push(vec![base[i], base[j], base[l]]);
+                    }
+                }
+            }
+            let mut scored: Vec<(f64, Vec<usize>)> = cands
+                .par_iter()
+                .map(|t| {
+                    let keys = Self::cfe_keys(x_data, n_rows, n_features, t);
+                    (
+                        Self::cfe_tuple_score(&keys, &targets, n_out, &prior, m),
+                        t.clone(),
+                    )
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (s, t) in scored.into_iter().take(self.cfe_max_triples) {
+                if s > 0.0 {
+                    tuples.push(t);
+                }
+            }
+        }
+        if self.cfe_max_quads > 0 && top_feats.len() >= 4 {
+            // Exhaustive arity-4 crosses among the strongest singles: the deep-
+            // combo region CatBoost's greedy in-tree CTR growth reaches only
+            // along split paths; static screening covers it completely.
+            let base: Vec<usize> = top_feats.iter().take(6).copied().collect();
+            let mut cands: Vec<Vec<usize>> = Vec::new();
+            for i in 0..base.len() {
+                for j in (i + 1)..base.len() {
+                    for l in (j + 1)..base.len() {
+                        for q in (l + 1)..base.len() {
+                            cands.push(vec![base[i], base[j], base[l], base[q]]);
+                        }
+                    }
+                }
+            }
+            let mut scored: Vec<(f64, Vec<usize>)> = cands
+                .par_iter()
+                .map(|t| {
+                    let keys = Self::cfe_keys(x_data, n_rows, n_features, t);
+                    (
+                        Self::cfe_tuple_score(&keys, &targets, n_out, &prior, m),
+                        t.clone(),
+                    )
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (s, t) in scored.into_iter().take(self.cfe_max_quads) {
+                if s > 0.0 {
+                    tuples.push(t);
+                }
+            }
+        }
+
+
+        // ── Per-tuple tables + cross-fit train lifts ──
+        struct TupleOut {
+            table: HashMap<i64, (f64, Vec<f64>)>,
+            lifts: Vec<f64>,  // n_rows x n_out, cross-fit clipped lift (prior m)
+            lifts2: Vec<f64>, // n_rows x n_out, lift at strong prior (16m)
+            logcs: Vec<f64>,  // n_rows, log1p(complement key count) — Counter CTR
+            arity: usize,
+            n_out: usize,
+        }
+        impl CfeTupleView for TupleOut {
+            fn lift(&self, row: usize, out: usize) -> f64 {
+                self.lifts[row * self.n_out + out]
+            }
+            fn lift2(&self, row: usize, out: usize) -> f64 {
+                self.lifts2[row * self.n_out + out]
+            }
+            fn logc(&self, row: usize) -> f64 {
+                self.logcs[row]
+            }
+            fn arity(&self) -> usize {
+                self.arity
+            }
+        }
+        let outs: Vec<TupleOut> = tuples
+            .par_iter()
+            .map(|feats| {
+                let keys = Self::cfe_keys(x_data, n_rows, n_features, feats);
+                let mut idx: HashMap<i64, usize> = HashMap::new();
+                let mut cnt: Vec<f64> = Vec::new();
+                let mut sums: Vec<f64> = Vec::new();
+                let mut fcnt: Vec<f64> = Vec::new();
+                let mut fsums: Vec<f64> = Vec::new();
+                for (row, &key) in keys.iter().enumerate() {
+                    if key == i64::MIN {
+                        continue;
+                    }
+                    let ki = *idx.entry(key).or_insert_with(|| {
+                        cnt.push(0.0);
+                        sums.extend(std::iter::repeat(0.0).take(n_out));
+                        fcnt.extend(std::iter::repeat(0.0).take(n_folds));
+                        fsums.extend(std::iter::repeat(0.0).take(n_folds * n_out));
+                        cnt.len() - 1
+                    });
+                    let f = fold_of[row] as usize;
+                    cnt[ki] += 1.0;
+                    fcnt[ki * n_folds + f] += 1.0;
+                    for o in 0..n_out {
+                        let t = targets[row * n_out + o];
+                        sums[ki * n_out + o] += t;
+                        fsums[(ki * n_folds + f) * n_out + o] += t;
+                    }
+                }
+                let clip = Self::cfe_arity_clip(feats.len());
+                let m2 = m * 16.0;
+                let mut lifts = vec![0.0f64; n_rows * n_out];
+                let mut lifts2 = vec![0.0f64; n_rows * n_out];
+                for (row, &key) in keys.iter().enumerate() {
+                    if key == i64::MIN {
+                        continue;
+                    }
+                    let ki = idx[&key];
+                    let f = fold_of[row] as usize;
+                    let c = cnt[ki] - fcnt[ki * n_folds + f];
+                    // EA-evolved: reliability smoothing decoupled from posterior
+                    // smoothing (m_rel = 1.32 * m).
+                    let rel = c / (c + 1.32 * m);
+                    let rel2 = c / (c + m2);
+                    for o in 0..n_out {
+                        let s = sums[ki * n_out + o] - fsums[(ki * n_folds + f) * n_out + o];
+                        let lift_at = |mm: f64, relv: f64| -> f64 {
+                            let p = (s + mm * prior[o]) / (c + mm);
+                            let l = if is_reg {
+                                p - prior[o]
+                            } else {
+                                (Self::cfe_logit(p) - Self::cfe_logit(prior[o]))
+                                    .clamp(-clip, clip)
+                            };
+                            relv * l
+                        };
+                        lifts[row * n_out + o] = lift_at(m, rel);
+                        lifts2[row * n_out + o] = lift_at(m2, rel2);
+                    }
+                }
+                let mut logcs = vec![0.0f64; n_rows];
+                for (row, &key) in keys.iter().enumerate() {
+                    if key == i64::MIN {
+                        continue;
+                    }
+                    let ki = idx[&key];
+                    let f = fold_of[row] as usize;
+                    logcs[row] = (cnt[ki] - fcnt[ki * n_folds + f]).max(0.0).ln_1p();
+                }
+                let mut table: HashMap<i64, (f64, Vec<f64>)> = HashMap::with_capacity(idx.len());
+                for (key, ki) in idx.iter() {
+                    table.insert(
+                        *key,
+                        (cnt[*ki], sums[*ki * n_out..(*ki + 1) * n_out].to_vec()),
+                    );
+                }
+                TupleOut {
+                    table,
+                    lifts,
+                    lifts2,
+                    logcs,
+                    arity: feats.len(),
+                    n_out,
+                }
+            })
+            .collect();
+
+        let cols = Self::cfe_emit_columns(
+            &outs,
+            n_rows,
+            n_out,
+            &prior,
+            is_reg,
+            self.cfe_dual_prior,
+            self.cfe_counter,
+            self.cfe_aggmax,
+        );
+        self.cfe_tuples = tuples;
+        self.cfe_tables = outs.into_iter().map(|o| o.table).collect();
+        self.cfe_prior = prior;
+        self.cfe_n_out = n_out;
+        cols
+    }
+
+    /// Emit evidence columns from per-tuple lifts: one lift column per tuple
+    /// (binary/regression), plus PACT-style aggregates.
+    fn cfe_emit_columns(
+        outs: &[impl CfeTupleView],
+        n_rows: usize,
+        n_out: usize,
+        prior: &[f64],
+        is_reg: bool,
+        dual_prior: bool,
+        counter_on: bool,
+        aggmax_on: bool,
+    ) -> Vec<Vec<f64>> {
+        let mut cols: Vec<Vec<f64>> = Vec::new();
+        if n_out == 1 {
+            for o in outs {
+                cols.push((0..n_rows).map(|r| o.lift(r, 0)).collect());
+                if dual_prior {
+                    cols.push((0..n_rows).map(|r| o.lift2(r, 0)).collect());
+                }
+                if counter_on {
+                    // Counter-CTR companion: key frequency (log1p count).
+                    cols.push((0..n_rows).map(|r| o.logc(r)).collect());
+                }
+            }
+            // PACT aggregates: NB-total + per-arity NB + per-arity max.
+            let prior_logit = if is_reg {
+                prior[0]
+            } else {
+                Self::cfe_logit(prior[0])
+            };
+            let mut nb_total = vec![0.0f64; n_rows];
+            let mut nb_arity = vec![vec![0.0f64; n_rows]; 3];
+            let mut max_arity = vec![vec![f64::NEG_INFINITY; n_rows]; 3];
+            let mut count_arity = [0.0f64; 3];
+            for o in outs {
+                let a = o.arity().min(3) - 1;
+                count_arity[a] += 1.0;
+                for r in 0..n_rows {
+                    let v = o.lift(r, 0);
+                    nb_total[r] += v;
+                    nb_arity[a][r] += v;
+                    if v > max_arity[a][r] {
+                        max_arity[a][r] = v;
+                    }
+                }
+            }
+            let total_n: f64 = count_arity.iter().sum();
+            cols.push(
+                nb_total
+                    .iter()
+                    .map(|&s| prior_logit + s / total_n.max(1.0).powf(0.723))
+                    .collect(),
+            );
+            for a in 0..3 {
+                if count_arity[a] > 0.0 {
+                    cols.push(
+                        nb_arity[a]
+                            .iter()
+                            .map(|&s| prior_logit + s / count_arity[a].max(1.0).powf(0.723))
+                            .collect(),
+                    );
+                    if aggmax_on {
+                        cols.push(
+                            max_arity[a]
+                                .iter()
+                                .map(|&v| if v.is_finite() { v } else { 0.0 })
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        } else {
+            // Multiclass: per-class NB aggregate columns only (K columns),
+            // plus per-class max lift (K columns).
+            let total_n = outs.len() as f64;
+            for o_cls in 0..n_out {
+                let prior_logit = Self::cfe_logit(prior[o_cls]);
+                let mut nb = vec![0.0f64; n_rows];
+                let mut mx = vec![f64::NEG_INFINITY; n_rows];
+                for o in outs {
+                    for r in 0..n_rows {
+                        let v = o.lift(r, o_cls);
+                        nb[r] += v;
+                        if v > mx[r] {
+                            mx[r] = v;
+                        }
+                    }
+                }
+                cols.push(
+                    nb.iter()
+                        .map(|&s| prior_logit + s / total_n.max(1.0).powf(0.723))
+                        .collect(),
+                );
+                if aggmax_on {
+                cols.push(
+                    mx.iter()
+                        .map(|&v| if v.is_finite() { v } else { 0.0 })
+                        .collect(),
+                );
+                }
+            }
+        }
+        cols
+    }
+
+    /// Evidence columns for eval/predict rows using the FULL trained tables.
+    pub(super) fn cat_fold_evidence_columns_for_raw(
+        &self,
+        x_data: &[f64],
+        n_rows: usize,
+        n_features: usize,
+    ) -> Vec<Vec<f64>> {
+        if self.cfe_tuples.is_empty() || self.cfe_n_out == 0 || n_rows == 0 {
+            return Vec::new();
+        }
+        let n_out = self.cfe_n_out;
+        let m = self.cfe_smooth.max(1e-6);
+        let is_reg = self.task != "binary" && self.task != "multiclass";
+        struct FullOut {
+            lifts: Vec<f64>,
+            lifts2: Vec<f64>,
+            logcs: Vec<f64>,
+            arity: usize,
+            n_out: usize,
+        }
+        impl CfeTupleView for FullOut {
+            fn lift(&self, row: usize, out: usize) -> f64 {
+                self.lifts[row * self.n_out + out]
+            }
+            fn lift2(&self, row: usize, out: usize) -> f64 {
+                self.lifts2[row * self.n_out + out]
+            }
+            fn logc(&self, row: usize) -> f64 {
+                self.logcs[row]
+            }
+            fn arity(&self) -> usize {
+                self.arity
+            }
+        }
+        let outs: Vec<FullOut> = self
+            .cfe_tuples
+            .par_iter()
+            .zip(self.cfe_tables.par_iter())
+            .map(|(feats, table)| {
+                let keys = Self::cfe_keys(x_data, n_rows, n_features, feats);
+                let clip = Self::cfe_arity_clip(feats.len());
+                let m2 = m * 16.0;
+                let mut lifts = vec![0.0f64; n_rows * n_out];
+                let mut lifts2 = vec![0.0f64; n_rows * n_out];
+                let mut logcs = vec![0.0f64; n_rows];
+                for (row, &key) in keys.iter().enumerate() {
+                    if key == i64::MIN {
+                        continue;
+                    }
+                    if let Some((c, sums)) = table.get(&key) {
+                        logcs[row] = c.max(0.0).ln_1p();
+                        let rel = c / (c + 1.32 * m);
+                        let rel2 = c / (c + m2);
+                        for o in 0..n_out {
+                            let lift_at = |mm: f64, relv: f64| -> f64 {
+                                let p = (sums[o] + mm * self.cfe_prior[o]) / (c + mm);
+                                let l = if is_reg {
+                                    p - self.cfe_prior[o]
+                                } else {
+                                    (Self::cfe_logit(p) - Self::cfe_logit(self.cfe_prior[o]))
+                                        .clamp(-clip, clip)
+                                };
+                                relv * l
+                            };
+                            lifts[row * n_out + o] = lift_at(m, rel);
+                            lifts2[row * n_out + o] = lift_at(m2, rel2);
+                        }
+                    }
+                }
+                FullOut {
+                    lifts,
+                    lifts2,
+                    logcs,
+                    arity: feats.len(),
+                    n_out,
+                }
+            })
+            .collect();
+        Self::cfe_emit_columns(
+            &outs,
+            n_rows,
+            n_out,
+            &self.cfe_prior,
+            is_reg,
+            self.cfe_dual_prior,
+            self.cfe_counter,
+            self.cfe_aggmax,
+        )
+    }
+}
+
+/// View trait so train-time and predict-time tuple outputs share the column
+/// emission code.
+impl GTBoostModel {
+    /// CFE stage 2 — RESIDUAL evidence: train a small internal warmup model
+    /// (high-card cats masked, mirroring demotion), then build a second
+    /// evidence table set over the SAME tuples with the warmup's residual
+    /// gradients as targets. Captures the categorical structure the mains
+    /// cannot explain — the adaptive-encoding idea of "residual-refreshed
+    /// CTRs" with purely STATIC tables (lookup-only at predict, no epochs).
+    /// Returns the cross-fit train columns (one lift column per tuple + one
+    /// NB aggregate).
+    pub(super) fn build_cfe_residual_evidence(
+        &mut self,
+        binned: &BinnedData,
+        x_data: &[f64],
+        y: &[f64],
+        n_rows: usize,
+        n_features: usize,
+    ) -> Vec<Vec<f64>> {
+        self.cfe_resid_tables.clear();
+        self.cfe_resid_prior = 0.0;
+        if self.cfe_residual_rounds == 0 || self.cfe_tuples.is_empty() || n_rows < 80 {
+            return Vec::new();
+        }
+        let is_binary = self.task == "binary";
+        if !is_binary && self.task != "regression" {
+            return Vec::new(); // binary + regression first
+        }
+        // Warmup feature mask: mirror demotion (no high-card raw cat splits,
+        // so memorizable structure can't hide the residual signal).
+        let mask: Vec<bool> = (0..binned.n_features)
+            .map(|f| {
+                if f < self.cat_features.len() && self.cat_features[f] {
+                    binned.n_bins(f) <= self.cfe_demote_min_card
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let base = if is_binary {
+            let p = (y[..n_rows].iter().sum::<f64>() / n_rows as f64).clamp(1e-6, 1.0 - 1e-6);
+            (p / (1.0 - p)).ln()
+        } else {
+            y[..n_rows].iter().sum::<f64>() / n_rows as f64
+        };
+        // CROSS-FIT warmup: one mini-model per fold trained on the fold's
+        // COMPLEMENT; row i's residual comes from the model that never saw
+        // row i's label. (An in-sample warmup leaks label noise into the
+        // residual targets and was measured to HURT.)
+        let n_folds = self.cfe_folds.clamp(2, 16).min(n_rows / 8).max(2);
+        let fold_of: Vec<u8> = {
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            let mut rng = StdRng::seed_from_u64(self.seed.wrapping_add(0xCFE2));
+            perm.shuffle(&mut rng);
+            let mut fo = vec![0u8; n_rows];
+            for (rank, &row) in perm.iter().enumerate() {
+                fo[row] = (rank % n_folds) as u8;
+            }
+            fo
+        };
+        let mut honest_margins = vec![base; n_rows];
+        for fold in 0..n_folds {
+            let train_idx: Vec<u32> = (0..n_rows as u32)
+                .filter(|&i| fold_of[i as usize] as usize != fold)
+                .collect();
+            let mut margins = vec![base; n_rows];
+            let mut g = vec![0.0f64; n_rows];
+            let mut h = vec![0.0f64; n_rows];
+            let lr = 0.3f64;
+            for _round in 0..self.cfe_residual_rounds {
+                for i in 0..n_rows {
+                    if is_binary {
+                        let p = 1.0 / (1.0 + (-margins[i].clamp(-30.0, 30.0)).exp());
+                        g[i] = p - y[i];
+                        h[i] = (p * (1.0 - p)).max(1e-6);
+                    } else {
+                        g[i] = margins[i] - y[i];
+                        h[i] = 1.0;
+                    }
+                }
+                let tree = DecisionTree::build_depthwise(
+                binned,
+                    &g,
+                    &h,
+                    &train_idx,
+                self.lambda_reg.max(1.0),
+                0.0,
+                0.0,
+                3,
+                1.0,
+                &mask,
+                1.0,
+                self.seed ^ (_round as u64).wrapping_mul(0x9E37_79B9),
+                0.0,
+                0.0,
+                0.0,
+                &[],
+                0.0,
+                false,
+                0.0,
+                false,
+                false,
+                false,
+                None,
+                false,
+                0.0,
+                crate::tree::CatPairConfig {
+                    enabled: false,
+                    top_k_cat: 0,
+                    k_buckets: 0,
+                    min_node_rows: 0,
+                    max_node_depth: 0,
+                    gain_margin: 0.0,
+                },
+
+                                None,
+                            
+                None,
+            
+                0.0,
+            
+                0.5,
+                1.0,
+            );
+                tree.add_predictions_binned(binned, &mut margins, lr);
+            }
+            for i in 0..n_rows {
+                if fold_of[i] as usize == fold {
+                    honest_margins[i] = margins[i];
+                }
+            }
+        }
+        // Residual targets on gradient scale from HONEST margins.
+        let mut g = vec![0.0f64; n_rows];
+        for i in 0..n_rows {
+            if is_binary {
+                let p = 1.0 / (1.0 + (-honest_margins[i].clamp(-30.0, 30.0)).exp());
+                g[i] = p - y[i];
+            } else {
+                g[i] = honest_margins[i] - y[i];
+            }
+        }
+        let targets: Vec<f64> = g.iter().map(|&v| -v).collect();
+        let prior = targets.iter().sum::<f64>() / n_rows as f64;
+        self.cfe_resid_prior = prior;
+        let m = self.cfe_smooth.max(1e-6);
+        let tuples = self.cfe_tuples.clone();
+        let mut cols: Vec<Vec<f64>> = Vec::new();
+        let mut agg = vec![0.0f64; n_rows];
+        let mut tables: Vec<HashMap<i64, (f64, Vec<f64>)>> = Vec::new();
+        for feats in &tuples {
+            let keys = Self::cfe_keys(x_data, n_rows, n_features, feats);
+            let mut idx: HashMap<i64, usize> = HashMap::new();
+            let mut cnt: Vec<f64> = Vec::new();
+            let mut sums: Vec<f64> = Vec::new();
+            let mut fcnt: Vec<f64> = Vec::new();
+            let mut fsums: Vec<f64> = Vec::new();
+            for (row, &key) in keys.iter().enumerate() {
+                if key == i64::MIN {
+                    continue;
+                }
+                let ki = *idx.entry(key).or_insert_with(|| {
+                    cnt.push(0.0);
+                    sums.push(0.0);
+                    fcnt.extend(std::iter::repeat(0.0).take(n_folds));
+                    fsums.extend(std::iter::repeat(0.0).take(n_folds));
+                    cnt.len() - 1
+                });
+                let f = fold_of[row] as usize;
+                cnt[ki] += 1.0;
+                sums[ki] += targets[row];
+                fcnt[ki * n_folds + f] += 1.0;
+                fsums[ki * n_folds + f] += targets[row];
+            }
+            let mut col = vec![0.0f64; n_rows];
+            for (row, &key) in keys.iter().enumerate() {
+                if key == i64::MIN {
+                    continue;
+                }
+                let ki = idx[&key];
+                let f = fold_of[row] as usize;
+                let c = cnt[ki] - fcnt[ki * n_folds + f];
+                let s_ = sums[ki] - fsums[ki * n_folds + f];
+                let rel = c / (c + 1.32 * m);
+                let lift = (s_ + m * prior) / (c + m) - prior;
+                col[row] = rel * lift;
+                agg[row] += col[row];
+            }
+            cols.push(col);
+            let mut table: HashMap<i64, (f64, Vec<f64>)> = HashMap::with_capacity(idx.len());
+            for (key, ki) in idx.iter() {
+                table.insert(*key, (cnt[*ki], vec![sums[*ki]]));
+            }
+            tables.push(table);
+        }
+        let t_pow = (tuples.len().max(1) as f64).powf(0.723);
+        cols.push(agg.iter().map(|&s_| prior + s_ / t_pow).collect());
+        self.cfe_resid_tables = tables;
+        cols
+    }
+
+    /// Residual-evidence columns for eval/predict rows from the stored tables.
+    pub(super) fn cfe_residual_columns_for_raw(
+        &self,
+        x_data: &[f64],
+        n_rows: usize,
+        n_features: usize,
+    ) -> Vec<Vec<f64>> {
+        if self.cfe_resid_tables.is_empty() || self.cfe_tuples.is_empty() || n_rows == 0 {
+            return Vec::new();
+        }
+        let m = self.cfe_smooth.max(1e-6);
+        let prior = self.cfe_resid_prior;
+        let mut cols: Vec<Vec<f64>> = Vec::new();
+        let mut agg = vec![0.0f64; n_rows];
+        for (feats, table) in self.cfe_tuples.iter().zip(self.cfe_resid_tables.iter()) {
+            let keys = Self::cfe_keys(x_data, n_rows, n_features, feats);
+            let mut col = vec![0.0f64; n_rows];
+            for (row, &key) in keys.iter().enumerate() {
+                if key == i64::MIN {
+                    continue;
+                }
+                if let Some((c, sums)) = table.get(&key) {
+                    let rel = c / (c + 1.32 * m);
+                    let lift = (sums[0] + m * prior) / (c + m) - prior;
+                    col[row] = rel * lift;
+                    agg[row] += col[row];
+                }
+            }
+            cols.push(col);
+        }
+        let t_pow = (self.cfe_tuples.len().max(1) as f64).powf(0.723);
+        cols.push(agg.iter().map(|&s_| prior + s_ / t_pow).collect());
+        cols
+    }
+}
+
+pub(super) trait CfeTupleView: Sync {
+    fn lift(&self, row: usize, out: usize) -> f64;
+    fn lift2(&self, row: usize, out: usize) -> f64;
+    fn logc(&self, row: usize) -> f64;
+    fn arity(&self) -> usize;
 }
