@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "gtboost"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "numpy",
  "pyo3",

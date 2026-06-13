@@ -1,6 +1,6 @@
 [package]
 name = "gtboost"
-version = "0.1.0a2"
+version = "0.1.0-alpha.2"
 edition = "2021"
 description = "Rust/Python gradient boosting for tabular data"
 license = "MIT"
